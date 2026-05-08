@@ -355,6 +355,7 @@ class DictadoApp:
         self.status_lbl.pack(side="bottom", pady=(0, 3))
 
         r.protocol("WM_DELETE_WINDOW", self._on_close)
+        r.bind("<Escape>", lambda e: r.withdraw())
 
     # ── Helpers UI (siempre desde hilo principal vía after) ─────────
 
@@ -759,18 +760,22 @@ class DictadoApp:
             # Ocultar ventana con withdraw (compatible con overrideredirect).
             # Se restaura con el hotkey (toggle_recording detecta estado withdrawn).
             self.root.after(0, self.root.withdraw)
-            time.sleep(0.45)
+            time.sleep(0.12)
             try:
+                # Usar portapapeles + Ctrl+V para soporte fiable de tildes, Ñ y Unicode.
+                # xdotool type falla con caracteres no ASCII según el layout del teclado.
+                pyperclip.copy(text)
                 subprocess.run(
-                    ["xdotool", "type", "--clearmodifiers",
-                     "--delay", "0", "--", text],
-                    check=True, timeout=30,
+                    ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                    check=True, timeout=5,
                 )
             except FileNotFoundError:
-                # xdotool no instalado → fallback con pynput
+                # xdotool no instalado → fallback con pynput + portapapeles
                 try:
-                    ctrl = pynput_kb.Controller()
-                    ctrl.type(text)
+                    pyperclip.copy(text)
+                    kb = pynput_kb.Controller()
+                    with kb.pressed(pynput_kb.Key.ctrl):
+                        kb.tap('v')
                 except Exception:
                     pass
             except Exception:
