@@ -206,6 +206,7 @@ class DictadoApp:
         self._drag_x = 0
         self._drag_y = 0
         self._tray_icon = None
+        self._target_wid = ""   # ventana destino (guardada al activar el hotkey)
 
         self._build_ui()
         self._start_hotkey_listener()
@@ -236,8 +237,10 @@ class DictadoApp:
         r.overrideredirect(True)          # sin borde/título del sistema
         r.attributes("-topmost", True)
         r.configure(bg=BG, highlightbackground=BG3, highlightthickness=1)
-        r.geometry("310x260+80+80")           # ancho x alto + posición
-        r.resizable(False, False)
+        r.geometry("310x220+80+80")           # ancho x alto + posición
+        r.resizable(False, True)                  # solo altura ajustable
+        r.minsize(310, 180)
+        r.maxsize(310, 600)
         self.root = r
 
         # ── Cabecera arrastrable ─────────────────────────────────────
@@ -308,7 +311,8 @@ class DictadoApp:
         )
         self.txt.pack(fill="both", expand=True, side="left")
         sb.config(command=self.txt.yview)
-        self.txt.bind("<Button-1>", lambda e: self.txt.focus_set())
+        # focus_force necesario con overrideredirect para que el widget sea editable
+        self.txt.bind("<Button-1>", lambda e: self.root.after(1, self.txt.focus_force))
 
         self.txt.tag_configure("final",   foreground=FG)
         self.txt.tag_configure("partial", foreground=FG_DIM,
@@ -355,7 +359,11 @@ class DictadoApp:
         self.status_lbl.pack(side="bottom", pady=(0, 3))
 
         r.protocol("WM_DELETE_WINDOW", self._on_close)
-        r.bind("<Escape>", lambda e: r.withdraw())
+        # ESC en root Y en el widget de texto (por si el foco está dentro)
+        def _esc(e=None):
+            r.withdraw()
+        r.bind("<Escape>", _esc)
+        r.bind_all("<Escape>", _esc)
 
     # ── Helpers UI (siempre desde hilo principal vía after) ─────────
 
@@ -412,6 +420,16 @@ class DictadoApp:
         if ranges:
             self.txt.delete(ranges[0], ranges[-1])
 
+    def _auto_resize(self) -> None:
+        """Ajusta la altura de la ventana al contenido del área de texto (5–18 líneas)."""
+        try:
+            lines = int(self.txt.count("1.0", "end", "displaylines")[0] or 1)
+            lines = max(5, min(18, lines + 1))
+            self.txt.config(height=lines)
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
     def _append_final(self, text: str) -> None:
         """Añade texto final al widget, siempre al final del contenido editable."""
         self._clear_partial_in_widget()
@@ -420,6 +438,7 @@ class DictadoApp:
             sep = " " if current.strip() else ""
             self.txt.insert("end", sep + text, "final")
             self.txt.see("end")
+        self._auto_resize()
 
     def _refresh_partial(self) -> None:
         """Muestra/actualiza el texto parcial (itálica) al final del widget."""
@@ -429,6 +448,7 @@ class DictadoApp:
             sep = " " if current.strip() else ""
             self.txt.insert("end", sep + self.partial + "…", "partial")
             self.txt.see("end")
+        self._auto_resize()
 
     # ── Control de grabación ────────────────────────────────────────
 
@@ -751,35 +771,101 @@ class DictadoApp:
 
     # ── Escritura en cursor activo ──────────────────────────────────
 
+    # Clases WM de terminales conocidas (usan Ctrl+Shift+V para pegar)
+    _TERMINAL_CLASSES = {
+        "gnome-terminal-server", "gnome-terminal", "xterm", "urxvt",
+        "konsole", "terminator", "tilix", "alacritty", "kitty",
+        "xfce4-terminal", "mate-terminal", "lxterminal", "terminology",
+        "rxvt", "sakura", "yakuake", "guake", "qterminal", "st-256color",
+        "st", "foot", "wezterm",
+    }
+
+    def _is_terminal_window(self, wid: str) -> bool:
+        """Detecta si la ventana destino es una terminal usando WM_CLASS completo."""
+        try:
+            # xprop devuelve: WM_CLASS(STRING) = "instancia", "Clase"
+            rc = subprocess.run(
+                ["xprop", "-id", wid, "WM_CLASS"],
+                capture_output=True, text=True, timeout=2,
+            )
+            raw = rc.stdout.lower()
+            log.debug("_is_terminal: wid=%s WM_CLASS=%r", wid, rc.stdout.strip())
+            return any(t in raw for t in self._TERMINAL_CLASSES)
+        except Exception:
+            # Fallback: getwindowclassname
+            try:
+                rc = subprocess.run(
+                    ["xdotool", "getwindowclassname", wid],
+                    capture_output=True, text=True, timeout=2,
+                )
+                return any(t in rc.stdout.strip().lower() for t in self._TERMINAL_CLASSES)
+            except Exception:
+                return False
+
     def _type_at_cursor(self, text: str) -> None:
-        """Minimiza la ventana y escribe el texto en la ventana que tenga foco."""
+        """Minimiza la ventana y envía el texto a la ventana destino guardada.
+
+        Estrategia:
+          - Terminales → xdotool type (XTest, emulación de teclado real).
+            XTest es aceptado por todas las terminales y maneja Unicode
+            mapeando cada carácter a su keysym U+XXXX.
+          - Apps normales → portapapeles + Ctrl+V (instantáneo).
+        """
         if not text:
             return
 
+        target_wid = self._target_wid
+
         def _do() -> None:
-            # Ocultar ventana con withdraw (compatible con overrideredirect).
-            # Se restaura con el hotkey (toggle_recording detecta estado withdrawn).
             self.root.after(0, self.root.withdraw)
-            time.sleep(0.12)
+            time.sleep(0.25)  # esperar a que la ventana desaparezca
+
+            is_terminal = self._is_terminal_window(target_wid) if target_wid else False
+            log.debug("_type_at_cursor: wid=%s is_terminal=%s", target_wid, is_terminal)
+
+            # Activar la ventana destino si la conocemos
+            if target_wid:
+                try:
+                    subprocess.run(
+                        ["xdotool", "windowactivate", "--sync", target_wid],
+                        check=False, timeout=3,
+                    )
+                    time.sleep(0.12)
+                except Exception:
+                    pass
+
             try:
-                # Usar portapapeles + Ctrl+V para soporte fiable de tildes, Ñ y Unicode.
-                # xdotool type falla con caracteres no ASCII según el layout del teclado.
-                pyperclip.copy(text)
-                subprocess.run(
-                    ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-                    check=True, timeout=5,
-                )
+                if is_terminal:
+                    # XTest keyboard simulation: funciona en terminales, soporta
+                    # tildes y Ñ porque xdotool mapea Unicode → keysym U+XXXX.
+                    subprocess.run(
+                        ["xdotool", "type", "--clearmodifiers",
+                         "--delay", "20", "--", text],
+                        check=True, timeout=60,
+                    )
+                else:
+                    # Apps normales: portapapeles + Ctrl+V (más rápido)
+                    pyperclip.copy(text)
+                    subprocess.run(
+                        ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                        check=True, timeout=3,
+                    )
             except FileNotFoundError:
-                # xdotool no instalado → fallback con pynput + portapapeles
+                # xdotool no instalado → fallback pynput
                 try:
                     pyperclip.copy(text)
                     kb = pynput_kb.Controller()
-                    with kb.pressed(pynput_kb.Key.ctrl):
-                        kb.tap('v')
+                    if is_terminal:
+                        with kb.pressed(pynput_kb.Key.ctrl):
+                            with kb.pressed(pynput_kb.Key.shift):
+                                kb.tap('v')
+                    else:
+                        with kb.pressed(pynput_kb.Key.ctrl):
+                            kb.tap('v')
                 except Exception:
                     pass
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("_type_at_cursor error: %s", exc)
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -789,6 +875,18 @@ class DictadoApp:
         combo = self.config.get("hotkey", "combo", fallback=DEFAULT_HOTKEY)
 
         def activate() -> None:
+            # Guardar la ventana activa ANTES de que nuestra ventana tome el foco.
+            # En este momento el usuario está en la terminal u otra app.
+            try:
+                res = subprocess.run(
+                    ["xdotool", "getactivewindow"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                wid = res.stdout.strip()
+                if wid.isdigit():
+                    self._target_wid = wid
+            except Exception:
+                pass
             self.root.after(0, self.toggle_recording)
 
         watcher = _XGrabKeyWatcher(combo, activate)
@@ -1035,9 +1133,25 @@ class DictadoApp:
 
     def _show_window(self) -> None:
         """Restaura la ventana desde cualquier estado oculto."""
+        # Guardar ventana destino si aún no fue capturada por el hotkey
+        # (p.ej. al mostrar desde la bandeja del sistema).
+        if not self._target_wid:
+            try:
+                res = subprocess.run(
+                    ["xdotool", "getactivewindow"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                wid = res.stdout.strip()
+                if wid.isdigit():
+                    self._target_wid = wid
+            except Exception:
+                pass
         self.root.deiconify()
         self.root.attributes("-topmost", True)
         self.root.lift()
+        # Forzar foco dos veces: a los 80ms (primer mapeado) y a los 200ms (seguro)
+        self.root.after(80,  self.root.focus_force)
+        self.root.after(200, self.root.focus_force)
 
     def _quit_app(self) -> None:
         """Cierre completo de la aplicación."""
