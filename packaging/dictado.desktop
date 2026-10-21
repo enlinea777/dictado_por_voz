@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.1
+Type=Application
+Name=Dictado por Voz
+GenericName=Widget de dictado
+Comment=Transcripción de voz a texto en tiempo real (Vosk)
+Exec=dictado
+Icon=dictado
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=voz;dictado;transcripción;vosk;
+StartupNotify=false
+StartupWMClass=dictado

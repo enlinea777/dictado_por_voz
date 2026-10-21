@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versión a publicar (ej. 1.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Versión
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ]; then V="${GITHUB_REF_NAME#v}"; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Construyendo versión $V"
+
+  deb:
+    name: Debian (.deb)
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Construir paquete
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          chmod +x build-deb.sh
+          ./build-deb.sh
+      - name: Comprobar contenido
+        run: |
+          dpkg-deb --info deb-build/*.deb
+          dpkg-deb -c deb-build/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: deb-build/*.deb
+          if-no-files-found: error
+
+  rpm:
+    name: Fedora (.rpm)
+    needs: version
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Herramientas
+        run: dnf install -y git tar gzip rpm-build
+      - uses: actions/checkout@v4
+      - name: Construir paquete
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eux
+          mkdir -p /root/rpmbuild/SOURCES /root/rpmbuild/SPECS
+          git archive --format=tar.gz --prefix="dictado-$VERSION/" \
+              -o "/root/rpmbuild/SOURCES/dictado-$VERSION.tar.gz" HEAD
+          sed "s/^Version:.*/Version: $VERSION/" packaging/rpm/dictado.spec \
+              > /root/rpmbuild/SPECS/dictado.spec
+          rpmbuild -ba /root/rpmbuild/SPECS/dictado.spec
+          ls -l /root/rpmbuild/RPMS/*/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: /root/rpmbuild/RPMS/*/*.rpm
+          if-no-files-found: error
+
+  arch:
+    name: Arch Linux (.pkg.tar.zst)
+    needs: version
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Herramientas
+        run: pacman -Syu --noconfirm --needed git base-devel
+      - uses: actions/checkout@v4
+      - name: Construir paquete
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eux
+          git config --global --add safe.directory "$PWD"
+          mkdir -p /build/packaging/arch
+          cp packaging/arch/PKGBUILD packaging/arch/dictado.install \
+              /build/packaging/arch/
+          git archive --format=tar.gz --prefix="dictado-$VERSION/" \
+              -o "/build/packaging/arch/dictado-$VERSION.tar.gz" HEAD
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" /build/packaging/arch/PKGBUILD
+          useradd -m builder
+          chown -R builder:builder /build
+          cd /build/packaging/arch
+          runuser -u builder -- makepkg -d --noconfirm
+          mkdir -p /out && cp ./*.pkg.tar.zst /out/
+          ls -l /out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: /out/*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: Publicar release
+    needs: [version, deb, rpm, arch]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Preparar notas
+        run: |
+          find dist -type f -printf '%p (%s bytes)\n'
+          {
+            echo "## Dictado por Voz ${{ needs.version.outputs.version }}"
+            echo
+            echo "Paquetes generados automáticamente por GitHub Actions:"
+            echo
+            echo "| Distro | Archivo | Instalación |"
+            echo "|---|---|---|"
+            echo "| Debian/Ubuntu | \`dictado_*_all.deb\` | \`sudo apt install ./archivo.deb\` |"
+            echo "| Fedora | \`dictado-*.noarch.rpm\` | \`sudo dnf install ./archivo.rpm\` |"
+            echo "| Arch Linux | \`dictado-*.pkg.tar.zst\` | \`sudo pacman -U ./archivo.pkg.tar.zst\` |"
+            echo
+            echo "También puedes usar el script portable \`dictado-portable.sh\` (sin instalar)."
+            echo
+            echo "> Los paquetes crean el entorno Python en \`/var/lib/dictado/venv\`"
+            echo "> durante la instalación (necesita conexión a internet)."
+          } > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Dictado por Voz ${{ needs.version.outputs.version }}
+          body_path: notes.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/**/*.deb
+            dist/**/*.rpm
+            dist/**/*.pkg.tar.zst
+            dictado-portable.sh

@@ -1,0 +1,25 @@
+post_install() {
+    _venv=/var/lib/dictado/venv
+    if [ -e "$_venv" ] && ! "$_venv/bin/python3" -c "import sys" >/dev/null 2>&1; then
+        rm -rf "$_venv"
+    fi
+    if [ ! -x "$_venv/bin/python3" ]; then
+        rm -rf "$_venv"
+        python3 -m venv "$_venv" || return 0
+    fi
+    "$_venv/bin/pip" install --quiet --upgrade pip || true
+    "$_venv/bin/pip" install --quiet -r /usr/share/dictado/requirements.txt || \
+        echo "dictado: no se pudieron instalar las dependencias Python (¿sin red?)" >&2
+    command -v update-desktop-database >/dev/null 2>&1 && \
+        update-desktop-database -q /usr/share/applications || true
+    command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+}
+
+post_upgrade() {
+    post_install
+}
+
+pre_remove() {
+    rm -rf /var/lib/dictado/venv
+}

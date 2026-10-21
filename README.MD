@@ -70,7 +70,22 @@ sudo apt install wl-clipboard
 
 ## Instalación
 
-### Opción A — Paquete `.deb` (Ubuntu / Debian)
+### Opción A — Paquetes de la release (recomendado)
+
+Cada etiqueta `v*` publica automáticamente (GitHub Actions) los paquetes de
+las tres familias en **Releases**:
+
+| Distro | Archivo | Instalación |
+|---|---|---|
+| Debian / Ubuntu | `dictado_*_all.deb` | `sudo apt install ./dictado_*_all.deb` |
+| Fedora | `dictado-*.noarch.rpm` | `sudo dnf install ./dictado-*.noarch.rpm` |
+| Arch Linux | `dictado-*.pkg.tar.zst` | `sudo pacman -U ./dictado-*.pkg.tar.zst` |
+
+Los tres paquetes instalan el lanzador `/usr/bin/dictado`, la entrada de menú
+y el icono, y crean el entorno Python en `/var/lib/dictado/venv` durante la
+instalación (necesita conexión a internet la primera vez).
+
+### Opción B — Paquete `.deb` construido localmente (Ubuntu / Debian)
 
 ```bash
 # 1. Construir el paquete
@@ -89,7 +104,7 @@ dictado
 El instalador crea automáticamente el entorno virtual Python en
 `/var/lib/dictado/venv` e instala todas las dependencias pip.
 
-### Opción B — Script portable (sin instalación)
+### Opción C — Script portable (sin instalación)
 
 ```bash
 ./dictado-portable.sh
@@ -97,7 +112,7 @@ El instalador crea automáticamente el entorno virtual Python en
 
 Extrae `dictado.py`, instala un venv local si no existe, y ejecuta el programa.
 
-### Opción C — Desde fuente
+### Opción D — Desde fuente
 
 ```bash
 cd vosk-dictado
@@ -278,8 +293,27 @@ vosk-dictado/
 ├── requirements.txt      # Dependencias pip
 ├── build-deb.sh          # Genera el paquete .deb instalable
 ├── dictado-portable.sh   # Script portable autocontenido
+├── packaging/
+│   ├── dictado.desktop   # Entrada de menú compartida
+│   ├── launcher.sh       # Lanzador para rpm/Arch
+│   ├── icon/dictado.png  # Icono 128x128
+│   ├── rpm/dictado.spec  # Empaquetado Fedora/RHEL
+│   └── arch/             # PKGBUILD + .INSTALL (Arch Linux)
+├── .github/workflows/release.yml  # CI: deb + rpm + Arch → Release
 └── README.MD             # Este archivo
 ```
+
+### Publicar una release
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+GitHub Actions construye los tres paquetes en contenedores limpios
+(`ubuntu-latest`, `fedora:latest`, `archlinux:latest`) y los adjunta a la
+release junto con `dictado-portable.sh`. También se puede lanzar a mano desde
+*Actions → Release → Run workflow*.
 
 ---
 

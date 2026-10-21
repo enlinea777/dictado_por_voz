@@ -1,0 +1,25 @@
+# Maintainer: enlinea777 <enlinea777@gmail.com>
+pkgname=dictado
+pkgver=1.1.0
+pkgrel=1
+pkgdesc="Widget flotante de dictado por voz (Vosk + WebSocket)"
+arch=('any')
+url="https://github.com/enlinea777/dictado_por_voz"
+license=('GPL-3.0-or-later')
+depends=('python' 'python-pip' 'tk' 'portaudio' 'xdotool' 'xclip' 'wl-clipboard')
+install=dictado.install
+source=("dictado-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    install -Dm755 "$srcdir/$pkgname-$pkgver/packaging/launcher.sh" \
+        "$pkgdir/usr/bin/dictado"
+    install -Dm644 "$srcdir/$pkgname-$pkgver/dictado.py" \
+        "$pkgdir/usr/share/dictado/dictado.py"
+    install -Dm644 "$srcdir/$pkgname-$pkgver/requirements.txt" \
+        "$pkgdir/usr/share/dictado/requirements.txt"
+    install -Dm644 "$srcdir/$pkgname-$pkgver/packaging/dictado.desktop" \
+        "$pkgdir/usr/share/applications/dictado.desktop"
+    install -Dm644 "$srcdir/$pkgname-$pkgver/packaging/icon/dictado.png" \
+        "$pkgdir/usr/share/icons/hicolor/128x128/apps/dictado.png"
+}

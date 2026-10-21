@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 NAME="dictado"
-VERSION="1.1.0"
+VERSION="${VERSION:-1.1.0}"
 ARCH="all"
 PKG_DIR="deb-build/${NAME}_${VERSION}_${ARCH}"
 
@@ -72,6 +72,9 @@ chmod 755 "${PKG_DIR}/usr/bin/dictado"
 cp requirements.txt "${PKG_DIR}/usr/lib/dictado/requirements.txt"
 
 # ── .desktop (integración con menú de escritorio) ─────────────────────────────
+if [[ -f packaging/dictado.desktop ]]; then
+    cp packaging/dictado.desktop "${PKG_DIR}/usr/share/applications/dictado.desktop"
+else
 cat > "${PKG_DIR}/usr/share/applications/dictado.desktop" << 'DESKTOP'
 [Desktop Entry]
 Version=1.1
@@ -87,10 +90,22 @@ Keywords=voz;dictado;transcripción;vosk;
 StartupNotify=false
 StartupWMClass=dictado
 DESKTOP
+fi
 chmod 644 "${PKG_DIR}/usr/share/applications/dictado.desktop"
 
-# ── Icono PNG (generado con Pillow) ──────────────────────────────────────────
+# ── Icono PNG ────────────────────────────────────────────────────────────────
 ICON_OUT="${PKG_DIR}/usr/share/icons/hicolor/128x128/apps/dictado.png"
+ICON_SRC="packaging/icon/dictado.png"
+if [[ -f "$ICON_SRC" ]]; then
+    echo "Usando icono $ICON_SRC"
+    cp "$ICON_SRC" "$ICON_OUT"
+    chmod 644 "$ICON_OUT"
+    ICON_DONE=1
+else
+    ICON_DONE=0
+fi
+
+if [[ "$ICON_DONE" -eq 0 ]]; then
 PYTHON="${PWD}/venv/bin/python3"
 if [[ ! -x "$PYTHON" ]]; then
     PYTHON="python3"
@@ -131,6 +146,7 @@ out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/dictado.png"
 img.save(out)
 print(f"  Icono guardado: {out}")
 PYEOF
+fi
 
 # ── DEBIAN/control ────────────────────────────────────────────────────────────
 cat > "${PKG_DIR}/DEBIAN/control" << CONTROL
