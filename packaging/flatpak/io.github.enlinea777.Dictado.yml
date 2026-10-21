@@ -27,6 +27,10 @@ finish-args:
 modules:
   - name: wl-clipboard
     buildsystem: meson
+    config-opts:
+      # las completions de fish/zsh van a rutas absolutas de /usr
+      - -Dfishcompletiondir=no
+      - -Dzshcompletiondir=no
     sources:
       - type: git
         url: https://github.com/bugaevc/wl-clipboard.git
