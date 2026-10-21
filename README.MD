@@ -80,6 +80,7 @@ las tres familias en **Releases**:
 | Debian / Ubuntu | `dictado_*_all.deb` | `sudo apt install ./dictado_*_all.deb` |
 | Fedora | `dictado-*.noarch.rpm` | `sudo dnf install ./dictado-*.noarch.rpm` |
 | Arch Linux | `dictado-*.pkg.tar.zst` | `sudo pacman -U ./dictado-*.pkg.tar.zst` |
+| Windows 10/11 | `dictado-*-setup.exe` | ejecutar el instalador (siguiente, siguiente) |
 
 Los tres paquetes instalan el lanzador `/usr/bin/dictado`, la entrada de menú
 y el icono, y crean el entorno Python en `/var/lib/dictado/venv` durante la
@@ -103,6 +104,26 @@ dictado
 
 El instalador crea automáticamente el entorno virtual Python en
 `/var/lib/dictado/venv` e instala todas las dependencias pip.
+
+### Windows (instalador)
+
+Descarga `dictado-<versión>-setup.exe` de la release y ejecútalo. El
+instalador (Inno Setup) copia `Dictado.exe` (generado con PyInstaller, sin
+necesidad de tener Python instalado), crea el acceso en el menú de inicio,
+opcionalmente en el escritorio, y añade el desinstalador.
+
+En Windows la app usa la API nativa:
+
+| Función | Linux | Windows |
+|---|---|---|
+| Atajo global | portal GlobalShortcuts / XGrabKey | hook de teclado (`pynput`) |
+| Enviar texto | teclado virtual `uinput` / `SendInput` equivalente | `SendInput` con `KEYEVENTF_UNICODE` |
+| Pegar (modo alternativo) | `wl-copy` + `shift+insert` | portapapeles + `Ctrl+V` |
+| Bandeja del sistema | AppIndicator | bandeja nativa (`pystray`) |
+| Configuración/log | `~/.config/vosk-dictado/` | `%APPDATA%\vosk-dictado\` |
+
+El texto se escribe carácter a carácter con `SendInput` Unicode, así que las
+tildes y la ñ funcionan en cualquier ventana, incluida la consola.
 
 ### Opción C — Script portable (sin instalación)
 
@@ -298,7 +319,9 @@ vosk-dictado/
 │   ├── launcher.sh       # Lanzador para rpm/Arch
 │   ├── icon/dictado.png  # Icono 128x128
 │   ├── rpm/dictado.spec  # Empaquetado Fedora/RHEL
-│   └── arch/             # PKGBUILD + .INSTALL (Arch Linux)
+│   ├── arch/             # PKGBUILD + .INSTALL (Arch Linux)
+│   ├── windows/dictado.iss  # Instalador de Windows (Inno Setup)
+│   └── icon/dictado.{png,ico}
 ├── .github/workflows/release.yml  # CI: deb + rpm + Arch → Release
 └── README.MD             # Este archivo
 ```
@@ -310,9 +333,10 @@ git tag v1.1.0
 git push origin v1.1.0
 ```
 
-GitHub Actions construye los tres paquetes en contenedores limpios
-(`ubuntu-latest`, `fedora:latest`, `archlinux:latest`) y los adjunta a la
-release junto con `dictado-portable.sh`. También se puede lanzar a mano desde
+GitHub Actions construye los paquetes en entornos limpios: `.deb`
+(`ubuntu-latest`), `.rpm` (`fedora:latest`), Arch (`archlinux:latest`) y el
+instalador de Windows (`windows-latest` con PyInstaller + Inno Setup), y los
+adjunta a la release junto con `dictado-portable.sh`. También se puede lanzar a mano desde
 *Actions → Release → Run workflow*.
 
 ---

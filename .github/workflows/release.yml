@@ -111,9 +111,47 @@ jobs:
           path: /out/*.pkg.tar.zst
           if-no-files-found: error
 
+  windows:
+    name: Windows (instalador .exe)
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Construir ejecutable
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --name Dictado `
+            --icon packaging/icon/dictado.ico `
+            --collect-all sounddevice `
+            --collect-submodules pystray `
+            --hidden-import pystray._win32 `
+            dictado.py
+      - name: Instalador (Inno Setup)
+        shell: pwsh
+        run: |
+          $ver = "${{ needs.version.outputs.version }}"
+          Copy-Item dist/Dictado.exe packaging/windows/Dictado.exe
+          Copy-Item packaging/icon/dictado.ico packaging/windows/dictado.ico
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DMyAppVersion=$ver" "packaging\windows\dictado.iss"
+          Get-ChildItem packaging/windows/Output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: packaging/windows/Output/*.exe
+          if-no-files-found: error
+
   release:
     name: Publicar release
-    needs: [version, deb, rpm, arch]
+    needs: [version, deb, rpm, arch, windows]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -134,6 +172,7 @@ jobs:
             echo "| Debian/Ubuntu | \`dictado_*_all.deb\` | \`sudo apt install ./archivo.deb\` |"
             echo "| Fedora | \`dictado-*.noarch.rpm\` | \`sudo dnf install ./archivo.rpm\` |"
             echo "| Arch Linux | \`dictado-*.pkg.tar.zst\` | \`sudo pacman -U ./archivo.pkg.tar.zst\` |"
+            echo "| Windows 10/11 | \`dictado-*-setup.exe\` | ejecutar el instalador |"
             echo
             echo "También puedes usar el script portable \`dictado-portable.sh\` (sin instalar)."
             echo
@@ -150,4 +189,5 @@ jobs:
             dist/**/*.deb
             dist/**/*.rpm
             dist/**/*.pkg.tar.zst
+            dist/**/*.exe
             dictado-portable.sh

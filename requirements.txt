@@ -5,6 +5,7 @@ pyperclip>=1.8.2
 numpy>=1.24.0
 pystray>=0.19
 Pillow>=9.0
-python-xlib>=0.33
-dbus-fast>=5.0
-evdev>=1.6
+# Sólo Linux (X11 / Wayland)
+python-xlib>=0.33; sys_platform == "linux"
+dbus-fast>=5.0; sys_platform == "linux"
+evdev>=1.6; sys_platform == "linux"

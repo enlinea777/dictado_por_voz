@@ -23,6 +23,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -38,9 +39,18 @@ import pystray
 import sounddevice as sd
 import tkinter as tk
 import websocket
-from Xlib import X as _X, XK as _XK
-from Xlib import display as _Xdisplay
-from Xlib import error as _Xerror
+
+# X11 sólo existe en Linux; en Windows la app usa la API nativa.
+try:
+    from Xlib import X as _X, XK as _XK
+    from Xlib import display as _Xdisplay
+    from Xlib import error as _Xerror
+    HAVE_X11 = True
+except Exception:                                    # pragma: no cover
+    _X = _XK = _Xdisplay = _Xerror = None
+    HAVE_X11 = False
+
+IS_WINDOWS = sys.platform == "win32"
 
 # pynput se importa bajo demanda: al importarlo abre una conexión X y en
 # sesiones Wayland sin Xauthority válido aborta el arranque de la app.
@@ -65,7 +75,10 @@ DEFAULT_COPY_HOTKEY = "<ctrl>+<alt>+c"
 SAMPLE_RATE    = 16000
 BLOCK_FRAMES   = 4096
 
-CONFIG_DIR  = Path.home() / ".config" / "vosk-dictado"
+if IS_WINDOWS:
+    CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "vosk-dictado"
+else:
+    CONFIG_DIR = Path.home() / ".config" / "vosk-dictado"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
 LOG_FILE    = CONFIG_DIR / "dictado.log"
 
@@ -79,6 +92,8 @@ CMD_COPY = "listo copiar"
 
 
 def _detect_wayland() -> bool:
+    if IS_WINDOWS:
+        return False
     if os.environ.get("WAYLAND_DISPLAY"):
         return True
     return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
@@ -109,14 +124,16 @@ GRAY   = "#475569"
 
 # ── Hotkey global via XGrabKey (no necesita root ni Record extension) ────────
 
-_MOD_MAP = {
-    "ctrl":    _X.ControlMask,
-    "control": _X.ControlMask,
-    "alt":     _X.Mod1Mask,
-    "shift":   _X.ShiftMask,
-    "super":   _X.Mod4Mask,
-    "cmd":     _X.Mod4Mask,
-}
+_MOD_MAP = {}
+if HAVE_X11:
+    _MOD_MAP = {
+        "ctrl":    _X.ControlMask,
+        "control": _X.ControlMask,
+        "alt":     _X.Mod1Mask,
+        "shift":   _X.ShiftMask,
+        "super":   _X.Mod4Mask,
+        "cmd":     _X.Mod4Mask,
+    }
 
 
 def _parse_combo(combo: str):
@@ -629,6 +646,102 @@ def _type_text(text: str) -> bool:
         return True
     except Exception as exc:
         log.warning("[uinput] Error escribiendo el texto: %s", exc)
+        return False
+
+
+# ── Windows: inyección de texto con SendInput ────────────────────────
+
+def _win_send_unicode(text: str) -> bool:
+    """Escribe el texto como si se tecleara, con SendInput Unicode.
+
+    KEYEVENTF_UNICODE permite enviar cualquier carácter (tildes, ñ, ¿...)
+    sin depender de la distribución de teclado.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        ULONG_PTR = (ctypes.c_ulonglong
+                     if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong)
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ULONG_PTR)]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ULONG_PTR)]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                        ("wParamH", wintypes.WORD)]
+
+        class INPUT(ctypes.Structure):
+            class _U(ctypes.Union):
+                # El tamaño del union debe ser el de MOUSEINPUT para que
+                # SendInput acepte cbSize.
+                _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT),
+                            ("hi", HARDWAREINPUT)]
+
+            _anonymous_ = ("u",)
+            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+        KEYEVENTF_KEYUP = 0x0002
+        KEYEVENTF_UNICODE = 0x0004
+        INPUT_KEYBOARD = 1
+
+        def emit(vk: int, scan: int, flags: int) -> None:
+            inp = INPUT()
+            inp.type = INPUT_KEYBOARD
+            inp.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
+            user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+        for ch in text:
+            if ch == "\n":
+                emit(0x0D, 0, 0)                 # VK_RETURN
+                emit(0x0D, 0, KEYEVENTF_KEYUP)
+            elif ch == "\t":
+                emit(0x09, 0, 0)                 # VK_TAB
+                emit(0x09, 0, KEYEVENTF_KEYUP)
+            else:
+                data = ch.encode("utf-16-le")
+                for i in range(0, len(data), 2):
+                    unit = int.from_bytes(data[i:i + 2], "little")
+                    emit(0, unit, KEYEVENTF_UNICODE)
+                    emit(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+            time.sleep(0.002)
+        return True
+    except Exception as exc:
+        log.warning("[windows] SendInput falló: %s", exc)
+        return False
+
+
+def _win_press_combo(combo: str) -> bool:
+    """Pulsa una combinación (ctrl+v, ctrl+shift+v) con SendInput."""
+    if not IS_WINDOWS:
+        return False
+    vk = {"ctrl": 0x11, "shift": 0x10, "alt": 0x12, "win": 0x5B,
+          "v": 0x56, "c": 0x43, "a": 0x41, "insert": 0x2D}
+    parts = [p.strip().strip("<>").lower() for p in combo.split("+") if p.strip()]
+    keys = [vk[p] for p in parts if p in vk]
+    if not keys:
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        for k in keys:
+            user32.keybd_event(k, 0, 0, 0)
+        for k in reversed(keys):
+            user32.keybd_event(k, 0, 2, 0)      # KEYEVENTF_KEYUP
+        return True
+    except Exception as exc:
+        log.warning("[windows] keybd_event falló: %s", exc)
         return False
 
 
@@ -1453,6 +1566,10 @@ class DictadoApp:
                 self._send_wayland(text)
                 return
 
+            if IS_WINDOWS:
+                self._send_windows(text)
+                return
+
             # Activar la ventana destino si la conocemos
             if target_wid:
                 try:
@@ -1499,6 +1616,26 @@ class DictadoApp:
                 log.debug("_type_at_cursor error: %s", exc)
 
         threading.Thread(target=_do, daemon=True).start()
+
+    def _send_windows(self, text: str) -> None:
+        """Envía el texto en Windows: lo teclea o lo pega (según ⚙)."""
+        mode = self.config.get("send", "mode", fallback="escribir")
+        if mode in ("escribir", "auto"):
+            if _win_send_unicode(text):
+                log.info("[windows] Texto escrito con SendInput (%d caracteres)",
+                         len(text))
+                return
+            log.warning("[windows] SendInput falló; se intenta pegar")
+
+        key = self.config.get("paste", "key", fallback=DEFAULT_PASTE_KEY)
+        method = _copy_to_clipboard(text)
+        if not method:
+            log.error("No se pudo copiar al portapapeles; texto: %r", text)
+            return
+        time.sleep(0.15)
+        log.debug("_send_windows: pegando con %s (método=%s)", key, method)
+        if not _win_press_combo(key):
+            log.error("No se pudo pegar el texto")
 
     def _send_wayland(self, text: str) -> None:
         """Envía el texto a la ventana enfocada en Wayland.
@@ -1556,7 +1693,7 @@ class DictadoApp:
             # En este momento el usuario está en la terminal u otra app.
             # En Wayland 'xdotool getactivewindow' no es fiable (devuelve la
             # ventana fantasma de XWayland), así que sólo se usa en X11.
-            if not IS_WAYLAND:
+            if HAVE_X11 and not IS_WAYLAND:
                 try:
                     res = subprocess.run(
                         ["xdotool", "getactivewindow"],
@@ -1569,6 +1706,20 @@ class DictadoApp:
                     pass
             # Nunca tocar Tk desde este hilo: la cola la consume el bucle UI.
             self._ui_queue.put(("toggle", None))
+
+        # Windows: pynput registra el atajo global con la API nativa.
+        if IS_WINDOWS:
+            try:
+                listener = _pynput().GlobalHotKeys({combo: activate})
+                listener.daemon = True
+                listener.start()
+                self._hotkey_listener = listener
+                self._hotkey_backends.append("win32-hotkey")
+                log.info("[hotkey] Windows: atajo global %r registrado", combo)
+            except Exception as exc:
+                log.warning("[hotkey] No se pudo registrar el atajo en "
+                            "Windows: %s", exc)
+            return
 
         # En Wayland el atajo global se registra con el portal; XGrabKey se
         # deja activo como respaldo para las aplicaciones X11 bajo XWayland.
@@ -1773,10 +1924,12 @@ class DictadoApp:
                 value=self.config.get("paste", "key_terminal",
                                       fallback=DEFAULT_PASTE_KEY_TERMINAL))
 
+        _sesion = "Windows" if IS_WINDOWS else ("Wayland" if IS_WAYLAND else "X11")
+        _inyeccion = ("SendInput (Unicode)" if IS_WINDOWS
+                      else ("uinput (evdev)" if IS_WAYLAND else "xdotool (XTest)"))
         tk.Label(
             dlg,
-            text=f"Sesión: {'Wayland' if IS_WAYLAND else 'X11'}  ·  "
-                 f"inyección: {'uinput (evdev)' if IS_WAYLAND else 'xdotool (XTest)'}",
+            text=f"Sesión: {_sesion}  ·  inyección: {_inyeccion}",
             fg=GRAY, bg=BG, font=("Segoe UI", 7),
         ).pack()
         if IS_WAYLAND:
@@ -2002,7 +2155,7 @@ class DictadoApp:
         """Restaura la ventana desde cualquier estado oculto."""
         # Guardar ventana destino si aún no fue capturada por el hotkey
         # (p.ej. al mostrar desde la bandeja del sistema).
-        if not self._target_wid:
+        if not self._target_wid and HAVE_X11 and not IS_WAYLAND:
             try:
                 res = subprocess.run(
                     ["xdotool", "getactivewindow"],
