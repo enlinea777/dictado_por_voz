@@ -152,13 +152,14 @@ jobs:
   macos:
     name: macOS (${{ matrix.arch }})
     needs: version
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - runner: macos-15-intel
             arch: x86_64
-          - runner: macos-14
+          - runner: macos-15
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
