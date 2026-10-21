@@ -12,6 +12,11 @@ runtime-version: '50'
 sdk: org.gnome.Sdk
 command: dictado
 
+# pip necesita red; el resto del build sigue siendo reproducible
+build-options:
+  build-args:
+    - --share=network
+
 finish-args:
   - --share=ipc
   - --socket=wayland
@@ -42,7 +47,7 @@ modules:
       - pip3 install --no-cache-dir --break-system-packages --prefix=/app
         sounddevice>=0.4.6 websocket-client>=1.6.0 pynput>=1.7.6
         pyperclip>=1.8.2 numpy>=1.24.0 pystray>=0.19 Pillow>=9.0
-        python-xlib>=0.33 dbus-fast>=5.0 evdev>=1.6
+        python-xlib>=0.33 dbus-fast>=5.0
       - install -Dm644 dictado.py /app/share/dictado/dictado.py
       - install -Dm755 packaging/flatpak/dictado.sh /app/bin/dictado
       - install -Dm644 packaging/flatpak/io.github.enlinea777.Dictado.desktop
