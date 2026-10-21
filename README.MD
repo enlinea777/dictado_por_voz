@@ -43,7 +43,10 @@ transcribe el texto en tiempo real directamente en la pantalla.
 ## Requisitos del sistema
 
 ```bash
+# X11
 sudo apt install python3-tk python3-venv xdotool xclip libportaudio2
+# Wayland (además)
+sudo apt install wl-clipboard
 ```
 
 | Dependencia | Versión mínima | Licencia |
@@ -58,7 +61,10 @@ sudo apt install python3-tk python3-venv xdotool xclip libportaudio2
 | pystray | ≥ 0.19 | LGPLv3 |
 | Pillow | ≥ 9.0 | HPND |
 | pyperclip | ≥ 1.8.2 | BSD 3-Clause |
+| dbus-fast | ≥ 5.0 | MIT |
+| evdev | ≥ 1.6 | BSD 3-Clause |
 | xdotool | cualquiera | MIT |
+| wl-clipboard | cualquiera | MIT |
 
 ---
 
@@ -72,7 +78,7 @@ cd vosk-dictado
 ./build-deb.sh
 
 # 2. Instalar
-sudo dpkg -i deb-build/dictado_1.0.0_all.deb
+sudo dpkg -i deb-build/dictado_1.1.0_all.deb
 sudo apt-get install -f   # instala dependencias del sistema si faltan
 
 # 3. Ejecutar
@@ -110,8 +116,62 @@ Al hacer clic en **⚙** se abre el diálogo de configuración:
 | Host / IP | `xeon` | Hostname o IP del servidor backend |
 | Puerto | `8085` | Puerto HTTP/WS del node-gateway |
 | Combinación | `<ctrl>+<space>` | Atajo global para iniciar/detener |
+| Copiar texto | `<ctrl>+<alt>+c` | Atajo global que copia la transcripción (útil en Wayland) |
+| Modo | `escribir` | (Wayland) escribir con teclado virtual o `pegar` con el portapapeles |
+| Tecla de pegado | `shift+insert` | (Wayland, modo pegar) tecla que se pulsa tras copiar |
+| Tecla (apps) | `ctrl+v` | (X11) tecla de pegado en aplicaciones normales |
+| Tecla (terminales) | `ctrl+shift+v` | (X11) tecla de pegado en terminales |
 
 El archivo de configuración se guarda en `~/.config/vosk-dictado/config.ini`.
+
+---
+
+## Wayland
+
+La app funciona igual en X11 y en Wayland, pero cada sesión usa un mecanismo
+distinto para el atajo global y para pegar el texto:
+
+| | X11 | Wayland (GNOME) |
+|---|---|---|
+| Atajo global | `XGrabKey` (python-xlib) | Portal `org.freedesktop.portal.GlobalShortcuts` + `XGrabKey` de respaldo |
+| Pegar texto | `xdotool` (XTest) | Portapapeles (`wl-copy`) + `uinput` (`evdev`) |
+| Permisos | ninguno | ninguno (`/dev/uinput` es del usuario de la sesión) |
+
+### Atajo global en Wayland
+
+El atajo se registra en GNOME mediante el portal **GlobalShortcuts**, así que
+aparece en *Ajustes → Teclado → Atajos de teclado* y se puede reasignar allí.
+
+Para ello el portal necesita un **app id**, que systemd deduce del scope
+`app-<id>-<aleatorio>.scope`. Los lanzadores (`run.sh`, `dictado-portable.sh`
+y `/usr/bin/dictado`) relanzan la app dentro de un scope
+`app-dictado-*.scope` automáticamente si hace falta. Lanzar la app desde el
+menú de GNOME también funciona.
+
+Si el portal no está disponible (por ejemplo, ejecutando `dictado.py` a mano
+desde una terminal) queda el respaldo `XGrabKey`, que sólo alcanza a
+aplicaciones X11 (incluidas las que corren bajo XWayland).
+
+### Enviar el texto en Wayland
+
+En Wayland no existe una API pública para saber qué ventana tiene el foco y
+por tanto no se puede detectar si es una terminal. Por eso, por defecto el
+texto **se escribe tecla a tecla con un teclado virtual** (`uinput` +
+`python-evdev`): llega igual a terminales y a cualquier aplicación, como si
+lo escribiera una persona, sin depender del portapapeles.
+
+- Cada carácter se traduce a su tecla real usando el **mapa de teclado
+  activo** (`xmodmap`), así que respeta la distribución configurada.
+- Las letras acentuadas se escriben con su **tecla muerta** (`´` + `a` = `á`),
+  igual que al teclear a mano.
+- Velocidad: ~50 caracteres/s (20 ms por tecla; 140 ms tras una tecla muerta).
+
+En ⚙ (*Modo*) se puede cambiar a **Pegar (portapapeles)**, que copia el texto
+con `wl-copy` y pulsa `shift+insert`. Es más rápido con textos largos, pero
+depende de que la app acepte esa tecla de pegado.
+
+`xdotool type` y `xdotool key` **no** sirven para Wayland: sólo afectan a
+clientes X11. Por eso no se usan en este modo.
 
 ---
 
@@ -185,6 +245,20 @@ transcripción en texto  →  node-gateway  →  dictado.py
 
 ---
 
+## Copiar el texto transcrito
+
+- Selecciona con el ratón y pulsa **Copiar**, o usa el **clic derecho →
+  Copiar / Seleccionar todo / Limpiar**.
+- Con teclado: `Ctrl+C` copia la selección (o todo el texto) y `Ctrl+A`
+  selecciona todo, **en X11**.
+- **En Wayland la ventana sin bordes no puede recibir el foco del teclado**
+  (GNOME no deja enfocar ventanas no gestionadas), así que `Ctrl+C` no llega
+  a la app. Para eso está el atajo global **`Ctrl+Alt+C`**, que copia el texto
+  aunque la ventana no tenga el foco (aparece en Ajustes → Teclado y se puede
+  reasignar).
+
+---
+
 ## Comandos de voz
 
 | Frase | Acción |
@@ -216,7 +290,15 @@ vosk-dictado/
 | `Error: No se puede alcanzar http://...` | Servidor apagado o IP/puerto incorrectos | Verificar host/puerto en ⚙ |
 | Sin audio / VU no reacciona | Micrófono no disponible o driver ALSA | `arecord -l` para listar dispositivos |
 | Ventana no aparece al presionar hotkey | Conflicto con otro programa | Cambiar la combinación en ⚙ |
-| El texto no se escribe en otro programa | `xdotool` no instalado | `sudo apt install xdotool` |
+| El texto no se escribe en otro programa | `xdotool` no instalado (X11) | `sudo apt install xdotool` |
+| Wayland: el atajo no responde | app sin *app id* (lanzada a mano desde una terminal) | usar `./run.sh` (relanza en scope systemd) o el menú de GNOME |
+| Wayland: el atajo no aparece en Ajustes | portal/backend no disponible | `systemctl --user restart xdg-desktop-portal-gnome`; revisar log |
+| Wayland: el texto no se pega | `wl-copy`/`/dev/uinput` sin acceso | `sudo apt install wl-clipboard`; comprobar `ls -l /dev/uinput` |
+| Wayland: el texto no llega a la terminal | modo «pegar» y la terminal no acepta la tecla | dejar el modo «Escribir» (por defecto) en ⚙ |
+| Wayland: faltan letras acentuadas | el mapa de teclado no tiene esa tecla muerta | revisar la distribución con `setxkbmap -query` |
+| Wayland: `Ctrl+C` no copia dentro del widget | ventana sin bordes = sin foco de teclado | usar el botón Copiar, clic derecho o `Ctrl+Alt+C` |
+| La ventana crece y los botones se ven | corregido: la ventana crece y las barras quedan ancladas abajo | — |
+| Tras actualizar Python (`3.12` → `3.14`) la app no arranca | venv de la versión anterior | `./install.sh` (recrea el venv); en el `.deb`, `sudo apt install --reinstall dictado` |
 | Icono en bandeja no aparece | GNOME sin extensión AppIndicator | Instalar "AppIndicator and KStatusNotifierItem Support" |
 
 Los logs detallados están en `~/.config/vosk-dictado/dictado.log`.
@@ -241,7 +323,10 @@ Este proyecto es software libre distribuido bajo **GNU GPL v3**.
 | pystray | moses-palmer/pystray | LGPLv3 |
 | Pillow | python-pillow/Pillow | HPND |
 | pyperclip | asweigart/pyperclip | BSD 3-Clause |
+| dbus-fast | dbus-fast/dbus-fast | MIT |
+| python-evdev | gvalkov/python-evdev | BSD 3-Clause |
 | xdotool | jordansissel/xdotool | MIT |
+| wl-clipboard | bugaevc/wl-clipboard | MIT |
 
 ```
 Copyright (C) 2026  enlinea777@gmail.com

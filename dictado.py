@@ -19,16 +19,17 @@ Atajo por defecto: Ctrl+Space (configurable en ⚙)
 import configparser
 import json
 import logging
+import os
 import queue
+import shutil
 import subprocess
-import sys
 import threading
 import time
+import unicodedata
 import urllib.request
 import urllib.error
+import uuid
 from pathlib import Path
-
-import re
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -37,15 +38,30 @@ import pystray
 import sounddevice as sd
 import tkinter as tk
 import websocket
-from pynput import keyboard as pynput_kb
 from Xlib import X as _X, XK as _XK
 from Xlib import display as _Xdisplay
 from Xlib import error as _Xerror
+
+# pynput se importa bajo demanda: al importarlo abre una conexión X y en
+# sesiones Wayland sin Xauthority válido aborta el arranque de la app.
+_pynput_kb = None
+
+
+def _pynput():
+    """Devuelve el módulo pynput.keyboard, importándolo la primera vez."""
+    global _pynput_kb
+    if _pynput_kb is None:
+        from pynput import keyboard as kb
+        _pynput_kb = kb
+    return _pynput_kb
 
 # ── Constantes ─────────────────────────────────────────────────────
 DEFAULT_HOST   = "xeon"
 DEFAULT_PORT   = "8085"
 DEFAULT_HOTKEY = "<ctrl>+<space>"
+# Copa la transcripción sin necesidad de foco (la ventana sin bordes no
+# recibe teclado en Wayland). Se registra como segundo atajo global.
+DEFAULT_COPY_HOTKEY = "<ctrl>+<alt>+c"
 SAMPLE_RATE    = 16000
 BLOCK_FRAMES   = 4096
 
@@ -55,6 +71,29 @@ LOG_FILE    = CONFIG_DIR / "dictado.log"
 
 CMD_SEND = "listo enviar"
 CMD_COPY = "listo copiar"
+
+# ── Detección de sesión ────────────────────────────────────────────
+# En Wayland el atajo global se registra con el portal GlobalShortcuts
+# y el texto se inyecta con uinput (evdev); en X11 se usa XGrabKey +
+# xdotool, igual que siempre.
+
+
+def _detect_wayland() -> bool:
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    return os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+
+
+IS_WAYLAND = _detect_wayland()
+
+# Combinación de teclas para pegar (portapapeles + tecla de pegado)
+DEFAULT_PASTE_KEY         = "ctrl+v"
+DEFAULT_PASTE_KEY_TERMINAL = "ctrl+shift+v"
+# En Wayland no se puede saber si el foco está en una terminal, y Ctrl+V no
+# pega en ellas: Shift+Insert funciona en terminales y en casi todas las apps.
+DEFAULT_PASTE_KEY_WAYLAND = "shift+insert"
+# Cómo enviar el texto en Wayland: "escribir" (teclado virtual) o "pegar".
+DEFAULT_SEND_MODE = "escribir"
 
 # ── Paleta ─────────────────────────────────────────────────────────
 BG     = "#1a1f2e"
@@ -152,12 +191,475 @@ class _XGrabKeyWatcher(threading.Thread):
             self._disp = None
 
 
+# ── Atajo global en Wayland: portal GlobalShortcuts ──────────────────
+#
+# El portal XDG (org.freedesktop.portal.GlobalShortcuts) es la única vía
+# soportada para registrar atajos globales en una sesión Wayland: la pide
+# el compositor, así que funciona con aplicaciones nativas de Wayland y
+# también con las que corren bajo XWayland.
+#
+# Referencia:
+#   https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html
+
+_XDG_MOD_MAP = {
+    "ctrl":    "Control",
+    "control": "Control",
+    "alt":     "Alt",
+    "shift":   "Shift",
+    "super":   "Super",
+    "cmd":     "Super",
+    "meta":    "Super",
+}
+
+
+def _combo_to_xdg_trigger(combo: str) -> str:
+    """Convierte '<ctrl>+<space>' en el trigger XDG '<Control>space'."""
+    mods, keys = [], []
+    for raw in combo.split("+"):
+        part = raw.strip().strip("<>").strip()
+        if not part:
+            continue
+        low = part.lower()
+        if low in _XDG_MOD_MAP:
+            mods.append(_XDG_MOD_MAP[low])
+        else:
+            keys.append(part if len(part) > 1 else low)
+    return "".join(f"<{m}>" for m in mods) + "".join(keys)
+
+
+class _PortalShortcutWatcher:
+    """Registra el atajo global mediante el portal GlobalShortcuts.
+
+    Funciona en cualquier sesión (el portal existe también bajo X11) pero
+    sólo se usa bajo Wayland, donde XGrabKey no es suficiente.
+    """
+
+    _BUS_NAME   = "org.freedesktop.portal.Desktop"
+    _OBJ_PATH   = "/org/freedesktop/portal/desktop"
+    _IFACE      = "org.freedesktop.portal.GlobalShortcuts"
+    def __init__(self, shortcuts, callback, parent_window: str = "") -> None:
+        # shortcuts: [(id, descripción, trigger XDG), ...]
+        self._shortcuts     = list(shortcuts)
+        self._ids           = {sid for sid, _, _ in self._shortcuts}
+        self._callback      = callback
+        self._parent_window = parent_window
+        self._active        = True
+        self._state         = "pending"   # pending | ok | error
+        self._error         = ""
+        self._loop          = None
+        self._thread        = None
+        self._session       = ""
+        self._bus           = None
+
+    # -- API pública -------------------------------------------------
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="portal-hotkey")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._active = False
+        loop = self._loop
+        if loop:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        self._loop = None
+
+    # -- Interno -----------------------------------------------------
+    def _run(self) -> None:
+        try:
+            import asyncio
+            asyncio.run(self._amain())
+        except Exception as exc:
+            self._state = "error"
+            self._error = str(exc)
+            log.warning("[portal] No se pudo registrar el atajo: %s", exc)
+            if "app id" in str(exc).lower():
+                log.warning("[portal] El proceso no tiene 'app id': el portal "
+                            "sólo concede app id a apps lanzadas desde el "
+                            "menú de GNOME o dentro de un scope systemd "
+                            "'app-dictado-*'. Se usará el atajo X11 de "
+                            "respaldo (sólo aplicaciones X11).")
+
+    @staticmethod
+    def _unwrap(value):
+        """dbus-fast puede devolver Variant o el valor ya desempaquetado."""
+        return value.value if hasattr(value, "value") else value
+
+    @staticmethod
+    def _request_path(bus, token: str) -> str:
+        """Ruta del objeto Request que el portal creará para ese token."""
+        sender = bus.unique_name.lstrip(":").replace(".", "_")
+        return f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+
+    async def _call_and_wait(self, bus, method, token: str):
+        """Llama a un método y espera su señal Response.
+
+        La ruta del Request es predecible a partir del handle_token, así que
+        se registra la escucha *antes* de la llamada: el portal puede emitir
+        Response y retirar el objeto antes de que lleguemos a mirarlo.
+        """
+        import asyncio
+        from dbus_fast import MessageType
+
+        path = self._request_path(bus, token)
+        fut = asyncio.get_running_loop().create_future()
+
+        def handler(msg) -> bool:
+            if (msg.message_type == MessageType.SIGNAL
+                    and msg.path == path
+                    and msg.member == "Response"):
+                if not fut.done():
+                    response = msg.body[0]
+                    raw = msg.body[1] or {}
+                    results = {
+                        k: (v.value if hasattr(v, "value") else v)
+                        for k, v in raw.items()
+                    }
+                    fut.set_result((response, results))
+                return True
+            return False
+
+        rule = ("type='signal',sender='org.freedesktop.portal.Desktop',"
+                "interface='org.freedesktop.portal.Request',member='Response',"
+                f"path='{path}'")
+        bus.add_message_handler(handler)
+        # El AddMatch va antes que la llamada en la misma conexión (orden FIFO).
+        bus._add_match_rule(rule)
+        try:
+            request_path = await method
+            if request_path != path:
+                log.warning("[portal] Ruta de Request inesperada: %s (esperada %s)",
+                            request_path, path)
+            return await asyncio.wait_for(fut, timeout=25)
+        finally:
+            bus.remove_message_handler(handler)
+            bus._remove_match_rule(rule)
+
+    async def _amain(self) -> None:
+        import asyncio
+        from dbus_fast import BusType, Variant
+        from dbus_fast.aio.message_bus import MessageBus
+
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+
+        bus = await MessageBus(bus_type=BusType.SESSION).connect()
+        self._bus = bus
+        introspection = await bus.introspect(self._BUS_NAME, self._OBJ_PATH)
+        obj = bus.get_proxy_object(self._BUS_NAME, self._OBJ_PATH, introspection)
+        iface = obj.get_interface(self._IFACE)
+        iface.on_activated(self._on_activated, unpack_variants=True)
+
+        # El portal exige 'session_handle_token' (si no, xdg-desktop-portal
+        # aborta con "session->token != NULL") y un 'handle_token' válido.
+        token = uuid.uuid4().hex
+        response, results = await self._call_and_wait(
+            bus,
+            iface.call_create_session({
+                "handle_token":         Variant("s", token),
+                "session_handle_token": Variant("s", token),
+            }),
+            token,
+        )
+        if response != 0:
+            raise RuntimeError("el portal rechazó la sesión (%s): %s"
+                               % (response, results))
+        session = self._unwrap(results.get("session_handle", ""))
+        if not session:
+            raise RuntimeError("el portal no devolvió session_handle")
+        self._session = session
+
+        shortcuts = [
+            (sid, {
+                "description":       Variant("s", desc),
+                "preferred_trigger": Variant("s", trigger),
+                "token_type":        Variant("s", "default"),
+            })
+            for sid, desc, trigger in self._shortcuts
+        ]
+        token = uuid.uuid4().hex
+        response, results = await self._call_and_wait(
+            bus,
+            iface.call_bind_shortcuts(
+                session, shortcuts, self._parent_window,
+                {"handle_token": Variant("s", token)}),
+            token,
+        )
+        if response != 0:
+            raise RuntimeError("el portal rechazó los atajos (%s): %s"
+                               % (response, results))
+        self._state = "ok"
+        # El portal puede reasignar el atajo si está ocupado: dejar constancia.
+        try:
+            bound = results.get("shortcuts")
+            bound = bound.value if hasattr(bound, "value") else bound
+            for sid, props in bound or []:
+                desc = props.get("trigger_description")
+                desc = desc.value if hasattr(desc, "value") else desc
+                log.info("[portal] Atajo %s → %s", sid, desc)
+        except Exception:
+            pass
+        log.info("[portal] Atajos registrados vía GlobalShortcuts")
+
+        while self._active:
+            await asyncio.sleep(0.5)
+
+    def _on_activated(self, session_handle, shortcut_id, timestamp, options) -> None:
+        if not self._active:
+            return
+        if shortcut_id not in self._ids:
+            return
+        if self._session and session_handle and session_handle != self._session:
+            return
+        try:
+            self._callback(shortcut_id)
+        except Exception as exc:
+            log.error("[portal] Error en el callback: %s", exc)
+
+
+# ── Wayland: inyección de teclas con uinput (evdev) ─────────────────
+# /dev/uinput lo escribe el usuario de la sesión (ACL de systemd-logind),
+# así que no hace falta ydotool ni permisos de root.
+
+_KEY_ALIASES = {
+    "ctrl": "KEY_LEFTCTRL", "control": "KEY_LEFTCTRL",
+    "shift": "KEY_LEFTSHIFT", "alt": "KEY_LEFTALT",
+    "super": "KEY_LEFTMETA", "meta": "KEY_LEFTMETA", "win": "KEY_LEFTMETA",
+    "space": "KEY_SPACE", "enter": "KEY_ENTER", "return": "KEY_ENTER",
+    "tab": "KEY_TAB", "escape": "KEY_ESC", "esc": "KEY_ESC",
+    "backspace": "KEY_BACKSPACE", "delete": "KEY_DELETE",
+}
+
+_MODIFIER_KEYS = ("KEY_LEFTCTRL", "KEY_LEFTSHIFT", "KEY_LEFTALT",
+                  "KEY_LEFTMETA", "KEY_RIGHTCTRL", "KEY_RIGHTSHIFT",
+                  "KEY_RIGHTALT", "KEY_RIGHTMETA")
+
+# Keysyms de teclas muertas (X11) → se usan para escribir letras acentuadas.
+_DEAD_KEY_KEYSYMS = {
+    0x0300: 0xfe50,  # grave
+    0x0301: 0xfe51,  # agudo
+    0x0302: 0xfe52,  # circunflejo
+    0x0303: 0xfe53,  # tilde
+    0x0304: 0xfe54,  # macron
+    0x0306: 0xfe55,  # breve
+    0x0307: 0xfe56,  # punto arriba
+    0x0308: 0xfe57,  # diéresis
+    0x030A: 0xfe58,  # anillo
+    0x030B: 0xfe59,  # doble agudo
+    0x030C: 0xfe5a,  # carón
+    0x0327: 0xfe5b,  # cedilla
+    0x0328: 0xfe5c,  # ogonek
+}
+
+_KEYSYM_NAMES = {
+    "Shift_L": 0xffe1, "Shift_R": 0xffe2, "Control_L": 0xffe3,
+    "Control_R": 0xffe4, "Alt_L": 0xffe9, "Alt_R": 0xffea,
+    "Super_L": 0xffeb, "Super_R": 0xffec, "Caps_Lock": 0xffe5,
+    "ISO_Level3_Shift": 0xfe03,
+    "dead_grave": 0xfe50, "dead_acute": 0xfe51, "dead_circumflex": 0xfe52,
+    "dead_tilde": 0xfe53, "dead_macron": 0xfe54, "dead_breve": 0xfe55,
+    "dead_abovedot": 0xfe56, "dead_diaeresis": 0xfe57, "dead_abovering": 0xfe58,
+    "dead_doubleacute": 0xfe59, "dead_caron": 0xfe5a, "dead_cedilla": 0xfe5b,
+    "dead_ogonek": 0xfe5c,
+}
+
+_uinput = None
+_keymap_cache = None
+
+
+def _uinput_device() -> "object":
+    """Crea (una sola vez) un teclado virtual con todas las teclas."""
+    global _uinput
+    if _uinput is not None:
+        return _uinput
+    from evdev import UInput, ecodes
+    caps = sorted({v for k, v in vars(ecodes).items()
+                   if k.startswith("KEY_") and isinstance(v, int) and 0 < v < 256})
+    _uinput = UInput({ecodes.EV_KEY: caps}, name="dictado-virtual")
+    log.info("[uinput] Teclado virtual creado")
+    return _uinput
+
+
+def _combo_to_evdev(combo: str):
+    """'<ctrl>+<shift>+v' → [KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V]."""
+    from evdev import ecodes
+    keys = []
+    for raw in combo.split("+"):
+        part = raw.strip().strip("<>").strip().lower()
+        if not part:
+            continue
+        name = _KEY_ALIASES.get(part)
+        if name is None:
+            name = "KEY_" + part.upper()
+        key = getattr(ecodes, name, None)
+        if key is None:
+            log.warning("[uinput] Tecla desconocida en %r: %r", combo, part)
+            return []
+        keys.append(key)
+    return keys
+
+
+def _uinput_press(combo: str) -> bool:
+    """Pulsa una combinación de teclas por uinput (sirve en Wayland)."""
+    keys = _combo_to_evdev(combo)
+    if not keys:
+        log.warning("[uinput] Combinación no soportada: %r", combo)
+        return False
+    try:
+        from evdev import ecodes
+        ui = _uinput_device()
+        for key in keys:
+            ui.write(ecodes.EV_KEY, key, 1)
+            ui.syn()
+        time.sleep(0.03)
+        for key in reversed(keys):
+            ui.write(ecodes.EV_KEY, key, 0)
+            ui.syn()
+        return True
+    except Exception as exc:
+        log.warning("[uinput] Error inyectando %r: %s", combo, exc)
+        return False
+
+
+def _keysym_by_name(name: str) -> int:
+    if name in _KEYSYM_NAMES:
+        return _KEYSYM_NAMES[name]
+    if name.startswith("U") and len(name) > 1:
+        try:
+            return int(name[1:], 16)
+        except ValueError:
+            pass
+    try:
+        from Xlib import XK
+        return XK.string_to_keysym(name)
+    except Exception:
+        return 0
+
+
+def _xkb_keymap() -> dict:
+    """keysym → (keycode evdev, nivel 0-3) según el mapa de teclado activo."""
+    global _keymap_cache
+    if _keymap_cache is not None:
+        return _keymap_cache
+    kmap = {}
+    try:
+        out = subprocess.run(["xmodmap", "-pke"], capture_output=True,
+                             text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if not line.startswith("keycode "):
+                continue
+            left, right = line.split("=", 1)
+            keycode = int(left.split()[1]) - 8      # X11 → evdev
+            for level, name in enumerate(right.split()[:4]):
+                ks = _keysym_by_name(name)
+                if ks and ks not in kmap:
+                    kmap[ks] = (keycode, level)
+    except Exception as exc:
+        log.warning("[uinput] No se pudo leer el mapa de teclado: %s", exc)
+    _keymap_cache = kmap
+    return kmap
+
+
+def _text_to_events(text: str):
+    """Texto → [(keycode, nivel)] o None si hay algún carácter imposible."""
+    kmap = _xkb_keymap()
+    if not kmap:
+        return None
+    events = []
+
+    def add_char(ch: str) -> bool:
+        ks = ord(ch) if ord(ch) < 0x100 else 0x01000000 + ord(ch)
+        if ks in kmap:
+            events.append(kmap[ks])
+            return True
+        # Letra acentuada: tecla muerta + letra base (á = ´ + a)
+        nfd = unicodedata.normalize("NFD", ch)
+        if len(nfd) == 2:
+            dead = _DEAD_KEY_KEYSYMS.get(ord(nfd[1]))
+            if dead in kmap:
+                events.append(kmap[dead])
+                return add_char(nfd[0])
+        return False
+
+    for ch in text:
+        if ch == "\n":
+            events.append((28, 0))          # KEY_ENTER
+        elif ch == "\t":
+            events.append((15, 0))          # KEY_TAB
+        elif not add_char(ch):
+            log.warning("[uinput] Carácter no escribible: %r", ch)
+            return None
+    return events
+
+
+def _type_text(text: str) -> bool:
+    """Escribe el texto tecla a tecla, como un teclado real (Wayland)."""
+    events = _text_to_events(text)
+    if not events:
+        return False
+    kmap = _xkb_keymap()
+    shift = kmap.get(0xffe1, (42, 0))[0]
+    altgr = kmap.get(0xfe03, (100, 0))[0]
+    dead_codes = {kc for ks, (kc, _) in kmap.items() if 0xfe50 <= ks <= 0xfe5d}
+    try:
+        from evdev import ecodes
+        ui = _uinput_device()
+        for keycode, level in events:
+            mods = ([altgr] if level & 2 else []) + ([shift] if level & 1 else [])
+            for mod in mods:
+                ui.write(ecodes.EV_KEY, mod, 1)
+            ui.syn()
+            ui.write(ecodes.EV_KEY, keycode, 1)
+            ui.syn()
+            ui.write(ecodes.EV_KEY, keycode, 0)
+            ui.syn()
+            for mod in reversed(mods):
+                ui.write(ecodes.EV_KEY, mod, 0)
+            ui.syn()
+            # Las teclas muertas necesitan que el IM las procese antes de la
+            # siguiente tecla; el resto puede ir rápido.
+            time.sleep(0.14 if keycode in dead_codes else 0.02)
+        return True
+    except Exception as exc:
+        log.warning("[uinput] Error escribiendo el texto: %s", exc)
+        return False
+
+
+def _copy_to_clipboard(text: str) -> str:
+    """Copia texto al portapapeles. Devuelve el método usado."""
+    if IS_WAYLAND and shutil.which("wl-copy"):
+        try:
+            proc = subprocess.run(["wl-copy"], input=text.encode("utf-8"),
+                                  timeout=10)
+            if proc.returncode == 0:
+                return "wl-copy"
+        except Exception as exc:
+            log.warning("[clipboard] wl-copy falló: %s", exc)
+    try:
+        pyperclip.copy(text)
+        return "pyperclip"
+    except Exception as exc:
+        log.warning("[clipboard] pyperclip falló: %s", exc)
+        return ""
+
+
 # ── Configuración ──────────────────────────────────────────────────
 
 def load_config() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
     cfg["server"] = {"host": DEFAULT_HOST, "port": DEFAULT_PORT}
-    cfg["hotkey"] = {"combo": DEFAULT_HOTKEY}
+    cfg["hotkey"] = {"combo": DEFAULT_HOTKEY, "copy_combo": DEFAULT_COPY_HOTKEY}
+    cfg["send"] = {"mode": DEFAULT_SEND_MODE}
+    cfg["paste"] = {"key": DEFAULT_PASTE_KEY,
+                    "key_terminal": DEFAULT_PASTE_KEY_TERMINAL,
+                    "key_wayland": DEFAULT_PASTE_KEY_WAYLAND}
     if CONFIG_FILE.exists():
         cfg.read(CONFIG_FILE, encoding="utf-8")
     return cfg
@@ -192,6 +694,7 @@ class DictadoApp:
 
         # Estado
         self.recording    = False
+        self._connecting  = False   # True mientras se hace health-check / handshake
         self.ws_app       = None
         self.ws_conn      = None
         self.audio_stream = None
@@ -203,6 +706,9 @@ class DictadoApp:
         self._audio_q  = queue.Queue(maxsize=200)
         self._ui_queue = queue.Queue()
         self._hotkey_listener = None
+        self._x11_watcher = None
+        self._hotkey_backends = []
+        self._last_hotkey_ts = 0.0
         self._drag_x = 0
         self._drag_y = 0
         self._tray_icon = None
@@ -258,8 +764,8 @@ class DictadoApp:
         # Botones PRIMERO con side="right" → siempre clickeables aunque state_lbl sea largo
         # Controles: ×/─ ocultan ventana; ⚙ settings
         for sym, hover_fg, action in [
-            ("×", RED, lambda: self.root.withdraw()),
-            ("─", FG,  lambda: self.root.withdraw()),
+            ("×", RED, lambda: self._hide_window()),
+            ("─", FG,  lambda: self._hide_window()),
             ("⚙", FG,  self._open_settings),
         ]:
             lbl = tk.Label(hdr, text=sym, fg=FG_DIM, bg=BG2,
@@ -295,7 +801,8 @@ class DictadoApp:
 
         # ── Área de texto + scrollbar ───────────────────────────────
         tf = tk.Frame(r, bg=BG, padx=6, pady=4)
-        tf.pack(fill="both", expand=True)
+        # Se empaqueta al final: las barras inferiores reservan su espacio
+        # primero y así los botones nunca quedan fuera de la ventana.
 
         sb = tk.Scrollbar(tf, bg=BG2, troughcolor=BG, width=6, bd=0,
                           relief="flat", highlightthickness=0)
@@ -318,9 +825,16 @@ class DictadoApp:
         self.txt.tag_configure("partial", foreground=FG_DIM,
                                font=("Segoe UI", 10, "italic"))
 
+        # Copiar/seleccionar como en cualquier editor (Tk no trae Ctrl+A y
+        # su Ctrl+C puede bloquearse si otro cliente posee el portapapeles).
+        for seq in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+            self.txt.bind(seq, self._copy_selection)
+        for seq in ("<Control-a>", "<Control-A>"):
+            self.txt.bind(seq, self._select_all_text)
+        self.txt.bind("<Button-3>", self._text_menu)
+
         # ── Botones centrados ────────────────────────────────────────
         bf = tk.Frame(r, bg=BG, pady=5)
-        bf.pack(fill="x")
 
         inner = tk.Frame(bf, bg=BG)
         inner.pack()   # sin side= → centra horizontalmente
@@ -340,7 +854,6 @@ class DictadoApp:
 
         # ── Palabras clave ──────────────────────────────────────────
         kw = tk.Frame(r, bg=BG, pady=2)
-        kw.pack(fill="x", padx=10)
         tk.Label(kw, text=f'"{CMD_SEND}"', fg=GRAY, bg=BG,
                  font=("Segoe UI", 7)).pack(side="left")
         tk.Label(kw, text="·", fg=GRAY, bg=BG,
@@ -356,12 +869,17 @@ class DictadoApp:
             r, text=f"{combo}  ·  {_h}:{_p}",
             fg=GRAY, bg=BG, font=("Segoe UI", 7),
         )
+        # Empaquetado de abajo arriba: estado, palabras clave, botones y,
+        # por último, el área de texto (que se lleva el espacio sobrante).
         self.status_lbl.pack(side="bottom", pady=(0, 3))
+        kw.pack(side="bottom", fill="x", padx=10)
+        bf.pack(side="bottom", fill="x")
+        tf.pack(fill="both", expand=True)
 
         r.protocol("WM_DELETE_WINDOW", self._on_close)
         # ESC en root Y en el widget de texto (por si el foco está dentro)
         def _esc(e=None):
-            r.withdraw()
+            self._hide_window()
         r.bind("<Escape>", _esc)
         r.bind_all("<Escape>", _esc)
 
@@ -407,6 +925,55 @@ class DictadoApp:
         self.dot.config(fg=color)
         self.state_lbl.config(text=msg, fg=color)
 
+    def _selected_text(self) -> str:
+        """Texto seleccionado en el área de texto ('' si no hay selección)."""
+        try:
+            return self.txt.get("sel.first", "sel.last")
+        except tk.TclError:
+            return ""
+
+    def _copy_from_shortcut(self) -> None:
+        """Copia (atajo global) aunque la ventana no tenga el foco."""
+        if not self._selected_text() and not self._get_text_for_action():
+            return
+        self._copy_selection()
+        self.root.after(1200, lambda: self._set_status("Listo", FG_DIM))
+
+    def _copy_selection(self, event=None):
+        """Copia la selección (o todo el texto) al portapapeles."""
+        text = self._selected_text() or self._get_text_for_action()
+        if not text:
+            return "break"
+        method = _copy_to_clipboard(text)
+        if method:
+            self._set_status("Copiado ✓", GREEN)
+            self.root.after(1500, lambda: self._set_status("Listo", FG_DIM))
+        else:
+            self._set_status("No se pudo copiar", RED)
+        return "break"
+
+    def _select_all_text(self, event=None):
+        """Ctrl+A: selecciona todo el texto transcrito."""
+        self.txt.tag_add("sel", "1.0", "end-1c")
+        self.txt.mark_set("insert", "1.0")
+        self.txt.see("1.0")
+        return "break"
+
+    def _text_menu(self, event):
+        """Menú contextual del área de texto."""
+        menu = tk.Menu(self.root, tearoff=0, bg=BG2, fg=FG,
+                       activebackground=BG3, activeforeground=FG,
+                       bd=0, font=("Segoe UI", 9))
+        menu.add_command(label="Copiar",            command=self._copy_selection)
+        menu.add_command(label="Seleccionar todo",  command=self._select_all_text)
+        menu.add_separator()
+        menu.add_command(label="Limpiar",           command=self._action_clear)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
     def _get_text_for_action(self) -> str:
         """Texto del widget excluyendo el parcial (itálica) al final."""
         ranges = self.txt.tag_ranges("partial")
@@ -421,12 +988,22 @@ class DictadoApp:
             self.txt.delete(ranges[0], ranges[-1])
 
     def _auto_resize(self) -> None:
-        """Ajusta la altura de la ventana al contenido del área de texto (5–18 líneas)."""
+        """Ajusta la ventana al contenido del texto (5–18 líneas).
+
+        Se cambia la altura de la ventana (no sólo la del widget) para que
+        el área de texto tenga sitio y los botones sigan anclados abajo.
+        """
         try:
             lines = int(self.txt.count("1.0", "end", "displaylines")[0] or 1)
             lines = max(5, min(18, lines + 1))
-            self.txt.config(height=lines)
+            if int(self.txt.cget("height")) != lines:
+                self.txt.config(height=lines)
             self.root.update_idletasks()
+            w = self.root.winfo_width() or 310
+            h = min(self.root.winfo_reqheight(),
+                    self.root.winfo_screenheight() - 120)
+            if abs(self.root.winfo_height() - h) > 1:
+                self.root.geometry(f"{w}x{h}")
         except Exception:
             pass
 
@@ -472,6 +1049,7 @@ class DictadoApp:
         url = self.ws_url
         log.info("Iniciando conexión → %s", url)
         self._set_status(f"Conectando…", GRAY)
+        self._connecting = True
         if self.ws_app:
             try:
                 self.ws_app.close()
@@ -495,17 +1073,22 @@ class DictadoApp:
                 log.error(msg)
                 self._ui_queue.put(("error", msg))
                 return
+            if not self._connecting:
+                log.info("Conexión cancelada antes de abrir el WebSocket")
+                return
             self._connect_ws()
         threading.Thread(target=_probe_then_connect, daemon=True, name="probe").start()
 
     def _stop_recording(self) -> None:
-        self.recording = False
-        self.partial   = ""
+        self.recording    = False
+        self._connecting  = False
+        self.partial      = ""
         if self.ws_conn:
             try:
                 self.ws_conn.send(json.dumps({"type": "stop"}))
             except Exception:
                 pass
+        self._close_ws()
         self._stop_audio()
         self.mic_btn.config(fg=FG_DIM)
         self.dot.config(fg=GRAY)
@@ -523,6 +1106,25 @@ class DictadoApp:
         # El stream persistente se cierra únicamente en _on_close().
         pass
 
+    def _close_ws(self) -> None:
+        """Cierra el WebSocket y descarta la conexión. Idempotente."""
+        self._connecting = False
+        if self.ws_app:
+            try:
+                self.ws_app.close()
+            except Exception:
+                pass
+            self.ws_app = None
+        self.ws_conn = None
+
+    def _hide_window(self) -> None:
+        """Oculta la ventana cerrando antes cualquier grabación/conexión activa."""
+        if self.recording or self._connecting:
+            self._stop_recording()
+        else:
+            self._close_ws()
+        self.root.withdraw()
+
     # ── WebSocket ───────────────────────────────────────────────────
 
     def _connect_ws(self) -> None:
@@ -531,6 +1133,13 @@ class DictadoApp:
 
         def on_open(ws) -> None:
             log.info("WebSocket abierto")
+            if not self._connecting:
+                log.info("Conexión cancelada antes del handshake — cerrando")
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                return
             self.ws_conn = ws
             ws.send(json.dumps({"type": "start", "settings": {}}))
 
@@ -619,7 +1228,11 @@ class DictadoApp:
         t = msg.get("type", "")
 
         if t == "ready":
-            self.recording = True
+            if not self._connecting:
+                log.info("'ready' ignorado: la conexión fue cancelada")
+                return
+            self.recording    = True
+            self._connecting  = False
             self.mic_btn.config(fg=GREEN)           # verde = escuchando
             self._set_status("Escuchando…", GREEN)
             self._start_audio()                     # inicia stream de audio
@@ -664,6 +1277,7 @@ class DictadoApp:
             self.txt.delete("1.0", "end")
             if clean:
                 self.txt.insert("end", clean, "final")
+            self._auto_resize()
             self._set_status("Enviando…", GREEN)
             self._type_at_cursor(clean)   # retira la ventana al escribir
             return
@@ -671,13 +1285,14 @@ class DictadoApp:
         if copy_idx != -1:
             clean = text[:copy_idx].rstrip()
             self._stop_recording()
-            pyperclip.copy(clean)
+            _copy_to_clipboard(clean)
             self.transcript = clean
             self.txt.delete("1.0", "end")
             if clean:
                 self.txt.insert("end", clean, "final")
+            self._auto_resize()
             self._set_status("Copiado ✓", GREEN)
-            self.root.after(400, self.root.withdraw)
+            self.root.after(400, self._hide_window)
 
     # ── Acciones de botones ─────────────────────────────────────────
 
@@ -691,16 +1306,23 @@ class DictadoApp:
         self._type_at_cursor(text)
 
     def _action_copy(self) -> None:
-        text = self._get_text_for_action()
-        if text:
-            pyperclip.copy(text)
+        # Si el usuario seleccionó un fragmento con el ratón, se copia eso.
+        text = self._selected_text() or self._get_text_for_action()
+        if not text:
+            return
+        if self.recording:
+            self._stop_recording()
+        if _copy_to_clipboard(text):
             self._set_status("Copiado ✓", GREEN)
-            self.root.after(400, self.root.withdraw)
+            self.root.after(600, self._hide_window)
+        else:
+            self._set_status("No se pudo copiar", RED)
 
     def _action_clear(self) -> None:
         self.transcript = ""
         self.partial    = ""
         self.txt.delete("1.0", "end")
+        self._auto_resize()
         self._set_status("Listo", GRAY)
 
     def _action_test(self) -> None:
@@ -806,10 +1428,14 @@ class DictadoApp:
         """Minimiza la ventana y envía el texto a la ventana destino guardada.
 
         Estrategia:
-          - Terminales → xdotool type (XTest, emulación de teclado real).
+          - X11 → Terminales: xdotool type (XTest, emulación de teclado real).
             XTest es aceptado por todas las terminales y maneja Unicode
             mapeando cada carácter a su keysym U+XXXX.
-          - Apps normales → portapapeles + Ctrl+V (instantáneo).
+            X11 → Apps normales: portapapeles + Ctrl+V (instantáneo).
+          - Wayland → portapapeles + tecla de pegado inyectada por uinput
+            (evdev). Es la única vía que alcanza a las aplicaciones nativas
+            de Wayland; nunca se llama a 'xdotool windowactivate' porque
+            robaría el foco de la aplicación nativa.
         """
         if not text:
             return
@@ -817,11 +1443,15 @@ class DictadoApp:
         target_wid = self._target_wid
 
         def _do() -> None:
-            self.root.after(0, self.root.withdraw)
+            self._ui_queue.put(("hide", None))
             time.sleep(0.25)  # esperar a que la ventana desaparezca
 
             is_terminal = self._is_terminal_window(target_wid) if target_wid else False
             log.debug("_type_at_cursor: wid=%s is_terminal=%s", target_wid, is_terminal)
+
+            if IS_WAYLAND:
+                self._send_wayland(text)
+                return
 
             # Activar la ventana destino si la conocemos
             if target_wid:
@@ -854,13 +1484,14 @@ class DictadoApp:
                 # xdotool no instalado → fallback pynput
                 try:
                     pyperclip.copy(text)
-                    kb = pynput_kb.Controller()
-                    if is_terminal:
-                        with kb.pressed(pynput_kb.Key.ctrl):
-                            with kb.pressed(pynput_kb.Key.shift):
+                    kb = _pynput()
+                    ctrl = kb.Key.ctrl
+                    shift = kb.Key.shift
+                    with kb.pressed(ctrl):
+                        if is_terminal:
+                            with kb.pressed(shift):
                                 kb.tap('v')
-                    else:
-                        with kb.pressed(pynput_kb.Key.ctrl):
+                        else:
                             kb.tap('v')
                 except Exception:
                     pass
@@ -869,37 +1500,166 @@ class DictadoApp:
 
         threading.Thread(target=_do, daemon=True).start()
 
+    def _send_wayland(self, text: str) -> None:
+        """Envía el texto a la ventana enfocada en Wayland.
+
+        Modo "escribir" (por defecto): teclea el texto con el teclado virtual
+        de uinput, igual que si lo escribiera una persona. Funciona en
+        terminales y en cualquier app, sin depender del portapapeles.
+        Modo "pegar": copia al portapapeles y pulsa Shift+Insert.
+        """
+        mode = self.config.get("send", "mode", fallback="escribir")
+        if mode in ("escribir", "auto"):
+            if _type_text(text):
+                log.info("[wayland] Texto escrito con el teclado virtual "
+                         "(%d caracteres)", len(text))
+                return
+            log.warning("[wayland] No se pudo escribir todo el texto; "
+                        "se intenta pegar desde el portapapeles")
+
+        key = self.config.get("paste", "key_wayland",
+                              fallback=DEFAULT_PASTE_KEY_WAYLAND)
+        method = _copy_to_clipboard(text)
+        if not method:
+            log.error("No se pudo copiar al portapapeles; texto: %r", text)
+            return
+        log.debug("_send_wayland: pegando con %s (método=%s)", key, method)
+
+        if _uinput_press(key):
+            return
+
+        # Sin uinput sólo podemos alcanzar a clientes X11
+        log.warning("[wayland] uinput no disponible; se intenta xdotool "
+                    "(sólo funciona en aplicaciones X11)")
+        try:
+            subprocess.run(["xdotool", "key", "--clearmodifiers", key],
+                           check=True, timeout=3)
+        except Exception as exc:
+            log.error("No se pudo enviar el texto: %s", exc)
+
     # ── Tecla de acceso rápido global ──────────────────────────────
 
     def _start_hotkey_listener(self) -> None:
         combo = self.config.get("hotkey", "combo", fallback=DEFAULT_HOTKEY)
+        self._hotkey_backends = []
 
         def activate() -> None:
+            # En Wayland el portal y XGrabKey pueden disparar a la vez
+            # (XGrabKey sólo ve clientes X11): un pequeño debounce evita
+            # que el atajo se cuente como dos.
+            now = time.monotonic()
+            if now - self._last_hotkey_ts < 0.4:
+                return
+            self._last_hotkey_ts = now
+
             # Guardar la ventana activa ANTES de que nuestra ventana tome el foco.
             # En este momento el usuario está en la terminal u otra app.
-            try:
-                res = subprocess.run(
-                    ["xdotool", "getactivewindow"],
-                    capture_output=True, text=True, timeout=2,
-                )
-                wid = res.stdout.strip()
-                if wid.isdigit():
-                    self._target_wid = wid
-            except Exception:
-                pass
-            self.root.after(0, self.toggle_recording)
+            # En Wayland 'xdotool getactivewindow' no es fiable (devuelve la
+            # ventana fantasma de XWayland), así que sólo se usa en X11.
+            if not IS_WAYLAND:
+                try:
+                    res = subprocess.run(
+                        ["xdotool", "getactivewindow"],
+                        capture_output=True, text=True, timeout=2,
+                    )
+                    wid = res.stdout.strip()
+                    if wid.isdigit():
+                        self._target_wid = wid
+                except Exception:
+                    pass
+            # Nunca tocar Tk desde este hilo: la cola la consume el bucle UI.
+            self._ui_queue.put(("toggle", None))
 
-        watcher = _XGrabKeyWatcher(combo, activate)
-        watcher.start()
-        self._hotkey_listener = watcher
+        # En Wayland el atajo global se registra con el portal; XGrabKey se
+        # deja activo como respaldo para las aplicaciones X11 bajo XWayland.
+        if IS_WAYLAND:
+            copy_combo = self.config.get("hotkey", "copy_combo",
+                                         fallback=DEFAULT_COPY_HOTKEY)
+
+            def on_portal(shortcut_id: str) -> None:
+                if shortcut_id == "dictado-copy":
+                    self._ui_queue.put(("copy", None))
+                else:
+                    activate()
+
+            portal = _PortalShortcutWatcher(
+                [
+                    ("dictado-toggle", "Dictado por voz (grabar / parar)",
+                     _combo_to_xdg_trigger(combo)),
+                    ("dictado-copy", "Dictado: copiar la transcripción",
+                     _combo_to_xdg_trigger(copy_combo)),
+                ],
+                on_portal, parent_window=self._x11_window_id())
+            portal.start()
+            self._hotkey_listener = portal
+            self._hotkey_backends.append("wayland-portal")
+            log.info("[hotkey] Sesión Wayland: atajo vía portal "
+                     "GlobalShortcuts (+ respaldo X11)")
+        else:
+            watcher = _XGrabKeyWatcher(combo, activate)
+            watcher.start()
+            self._hotkey_listener = watcher
+            self._hotkey_backends.append("x11-xgrabkey")
+            log.info("[hotkey] Sesión X11: atajo vía XGrabKey")
+
+        if IS_WAYLAND:
+            # Respaldo para clientes X11 mientras el portal no esté disponible
+            watcher = _XGrabKeyWatcher(combo, activate)
+            watcher.start()
+            self._hotkey_backends.append("x11-xgrabkey")
+            self._x11_watcher = watcher
+
+    def _x11_window_id(self) -> str:
+        """ID de la ventana X11 del widget (para el portal), o ''.
+
+        Tk crea una ventana interior y otra exterior (la que gestiona el
+        WM); el portal necesita la exterior, y con WM_CLASS/_NET_WM_PID
+        fijados para poder asociarla a la app.
+        """
+        try:
+            # La ventana X sólo existe en el servidor tras procesar la cola.
+            self.root.update_idletasks()
+            self.root.update()
+            wid = self.root.winfo_id()
+            root = _Xdisplay.Display()
+            try:
+                win = root.create_resource_object("window", wid)
+                parent = None
+                for _ in range(5):
+                    try:
+                        parent = win.query_tree().parent
+                        break
+                    except Exception:
+                        time.sleep(0.05)
+                        win = root.create_resource_object("window", wid)
+                toplevel = parent.id if parent else wid
+                obj = root.create_resource_object("window", toplevel)
+                obj.change_property(
+                    root.intern_atom("WM_CLASS"), root.intern_atom("STRING"),
+                    8, b"dictado\x00dictado\x00")
+                obj.change_property(
+                    root.intern_atom("_NET_WM_PID"),
+                    root.intern_atom("CARDINAL"), 32, [os.getpid()])
+                root.flush()
+                return hex(toplevel)
+            finally:
+                root.close()
+        except Exception as exc:
+            log.debug("[portal] No se pudo preparar la ventana X11: %s", exc)
+            try:
+                return hex(self.root.winfo_id())
+            except Exception:
+                return ""
 
     def _restart_hotkey(self) -> None:
-        if self._hotkey_listener:
-            try:
-                self._hotkey_listener.stop()
-            except Exception:
-                pass
-            self._hotkey_listener = None
+        for watcher in (self._hotkey_listener, self._x11_watcher):
+            if watcher:
+                try:
+                    watcher.stop()
+                except Exception:
+                    pass
+        self._hotkey_listener = None
+        self._x11_watcher = None
         self._start_hotkey_listener()
 
     # ── Diálogo de configuración ────────────────────────────────────
@@ -908,7 +1668,7 @@ class DictadoApp:
         dlg = tk.Toplevel(self.root)
         dlg.title("Configuración")
         dlg.configure(bg=BG)
-        dlg.geometry("320x500")
+        dlg.geometry("320x590")
         dlg.attributes("-topmost", True)
         dlg.resizable(False, False)
         # Centrar en pantalla (evitar problemas con overrideredirect en parent)
@@ -916,8 +1676,8 @@ class DictadoApp:
         sw = dlg.winfo_screenwidth()
         sh = dlg.winfo_screenheight()
         x = (sw - 320) // 2
-        y = (sh - 500) // 2
-        dlg.geometry(f"320x500+{x}+{y}")
+        y = max(0, (sh - 590) // 2)
+        dlg.geometry(f"320x590+{x}+{y}")
         dlg.lift()
         dlg.focus_force()
 
@@ -953,6 +1713,15 @@ class DictadoApp:
 
         k_var = lbl_entry(dlg, "Combinación:",
                           self.config.get("hotkey", "combo", fallback=DEFAULT_HOTKEY))
+        if IS_WAYLAND:
+            kc_var = lbl_entry(
+                dlg, "Copiar texto:",
+                self.config.get("hotkey", "copy_combo",
+                                fallback=DEFAULT_COPY_HOTKEY))
+        else:
+            kc_var = tk.StringVar(
+                value=self.config.get("hotkey", "copy_combo",
+                                      fallback=DEFAULT_COPY_HOTKEY))
 
         tk.Label(
             dlg,
@@ -960,12 +1729,88 @@ class DictadoApp:
             fg=GRAY, bg=BG, font=("Segoe UI", 7),
         ).pack()
 
+        tk.Label(
+            dlg, text="Envío del texto", fg=FG, bg=BG,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(pady=(10, 2))
+
+        if IS_WAYLAND:
+            modo_var = tk.StringVar(
+                value=self.config.get("send", "mode",
+                                      fallback=DEFAULT_SEND_MODE))
+            mf = tk.Frame(dlg, bg=BG)
+            mf.pack(fill="x", padx=14, pady=3)
+            tk.Label(mf, text="Modo:", fg=FG_DIM, bg=BG,
+                     font=("Segoe UI", 9), width=16, anchor="w").pack(side="left")
+            for texto, valor in (("Escribir (teclado)", "escribir"),
+                                 ("Pegar (portapapeles)", "pegar")):
+                tk.Radiobutton(
+                    mf, text=texto, value=valor, variable=modo_var,
+                    bg=BG, fg=FG, selectcolor=BG3, activebackground=BG,
+                    activeforeground=FG, highlightthickness=0, bd=0,
+                    font=("Segoe UI", 8), anchor="w",
+                ).pack(side="left", padx=2)
+        else:
+            modo_var = tk.StringVar(
+                value=self.config.get("send", "mode",
+                                      fallback=DEFAULT_SEND_MODE))
+
+        if IS_WAYLAND:
+            pk_var = lbl_entry(
+                dlg, "Tecla de pegado:",
+                self.config.get("paste", "key_wayland",
+                                fallback=DEFAULT_PASTE_KEY_WAYLAND))
+            pkt_var = tk.StringVar(
+                value=self.config.get("paste", "key_terminal",
+                                      fallback=DEFAULT_PASTE_KEY_TERMINAL))
+        else:
+            pk_var = lbl_entry(
+                dlg, "Tecla (apps):",
+                self.config.get("paste", "key", fallback=DEFAULT_PASTE_KEY))
+            # En X11 las terminales se escriben con 'xdotool type', así que
+            # no hace falta una tecla de pegado aparte.
+            pkt_var = tk.StringVar(
+                value=self.config.get("paste", "key_terminal",
+                                      fallback=DEFAULT_PASTE_KEY_TERMINAL))
+
+        tk.Label(
+            dlg,
+            text=f"Sesión: {'Wayland' if IS_WAYLAND else 'X11'}  ·  "
+                 f"inyección: {'uinput (evdev)' if IS_WAYLAND else 'xdotool (XTest)'}",
+            fg=GRAY, bg=BG, font=("Segoe UI", 7),
+        ).pack()
+        if IS_WAYLAND:
+            tk.Label(
+                dlg,
+                text="Shift+Insert pega en terminales y en casi todas las\n"
+                     "apps (ctrl+v sólo en apps, ctrl+shift+v en terminales).\n"
+                     "La ventana sin bordes no recibe el teclado en Wayland:\n"
+                     "para copiar usa el botón, el clic derecho o el atajo\n"
+                     "«Copiar texto».",
+                fg=GRAY, bg=BG, font=("Segoe UI", 7), justify="left",
+            ).pack()
+
         def save() -> None:
             self.config["server"]["host"] = h_var.get().strip()
             self.config["server"]["port"] = p_var.get().strip()
             if "hotkey" not in self.config:
                 self.config.add_section("hotkey")
             self.config["hotkey"]["combo"] = k_var.get().strip()
+            self.config["hotkey"]["copy_combo"] = (
+                kc_var.get().strip() or DEFAULT_COPY_HOTKEY)
+            if "paste" not in self.config:
+                self.config.add_section("paste")
+            if IS_WAYLAND:
+                self.config["paste"]["key_wayland"] = (
+                    pk_var.get().strip() or DEFAULT_PASTE_KEY_WAYLAND)
+            else:
+                self.config["paste"]["key"] = (
+                    pk_var.get().strip() or DEFAULT_PASTE_KEY)
+            self.config["paste"]["key_terminal"] = (
+                pkt_var.get().strip() or DEFAULT_PASTE_KEY_TERMINAL)
+            if "send" not in self.config:
+                self.config.add_section("send")
+            self.config["send"]["mode"] = modo_var.get().strip() or DEFAULT_SEND_MODE
             save_config(self.config)
             self._restart_hotkey()
             combo = k_var.get().strip()
@@ -1028,13 +1873,23 @@ class DictadoApp:
             "  pystray ≥0.19 — LGPLv3\n"
             "  Pillow ≥9.0 — HPND\n"
             "  pyperclip ≥1.8 — BSD 3-Clause\n"
-            "  xdotool — MIT"
+            "  dbus-fast ≥5.0 — MIT\n"
+            "  python-evdev ≥2.0 — BSD 3-Clause\n"
+            "  xdotool — MIT\n"
+            "  wl-clipboard — MIT (Wayland)"
         )
         tk.Label(
             dlg, text=credits,
             fg=GRAY, bg=BG, font=("Segoe UI", 7),
             justify="left", anchor="w",
         ).pack(fill="x", padx=16, pady=(0, 12))
+
+        # Ajustar el tamaño al contenido real (el texto de créditos crece y
+        # una altura fija recortaba la parte inferior).
+        dlg.update_idletasks()
+        w = max(320, dlg.winfo_reqwidth())
+        h = min(dlg.winfo_reqheight(), sh - 80)
+        dlg.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2)}")
 
     # ── Bucle de eventos UI (cola thread-safe) ──────────────────────
 
@@ -1046,6 +1901,7 @@ class DictadoApp:
                     self._handle_msg(data)
                 elif evt == "error":
                     self._set_status(f"Error: {data}", RED)
+                    self._close_ws()
                     self._stop_audio()
                     self.recording = False
                     self._audio_level = 0.0
@@ -1057,10 +1913,21 @@ class DictadoApp:
                         self._stop_audio()
                         self.mic_btn.config(fg=GRAY)
                         self._set_status(f"Conexión cerrada  {detail}", RED)
+                    self._close_ws()
                 elif evt == "test_ok":
                     self._set_status(f"✓ {data}", GREEN)
                 elif evt == "test_fail":
                     self._set_status(f"✗ {data}", RED)
+                elif evt == "toggle":
+                    self.toggle_recording()
+                elif evt == "copy":
+                    self._copy_from_shortcut()
+                elif evt == "show":
+                    self._show_window()
+                elif evt == "hide":
+                    self._hide_window()
+                elif evt == "quit":
+                    self._quit_app()
         except queue.Empty:
             pass
         self.root.after(50, self._poll_ui_queue)
@@ -1068,8 +1935,8 @@ class DictadoApp:
     # ── Cierre limpio ───────────────────────────────────────────────
 
     def _on_close(self) -> None:
-        """Oculta la ventana; la app sigue en segundo plano. Usa el hotkey para volver."""
-        self.root.withdraw()
+        """Oculta la ventana cerrando antes la conexión; la app sigue en segundo plano."""
+        self._hide_window()
 
     # ── Bandeja del sistema (system tray) ───────────────────────────
 
@@ -1102,11 +1969,11 @@ class DictadoApp:
     def _start_tray(self) -> None:
         """Inicia el icono en la bandeja del sistema en un hilo dedicado."""
         def on_show(icon, item):
-            self.root.after(0, self._show_window)
+            self._ui_queue.put(("show", None))
 
         def on_quit(icon, item):
             icon.stop()
-            self.root.after(0, self._quit_app)
+            self._ui_queue.put(("quit", None))
 
         menu = pystray.Menu(
             pystray.MenuItem("Mostrar / Ocultar", on_show, default=True),
@@ -1166,6 +2033,11 @@ class DictadoApp:
         if self._hotkey_listener:
             try:
                 self._hotkey_listener.stop()
+            except Exception:
+                pass
+        if self._x11_watcher:
+            try:
+                self._x11_watcher.stop()
             except Exception:
                 pass
         if self.ws_app:

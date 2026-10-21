@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 NAME="dictado"
-VERSION="1.0.0"
+VERSION="1.1.0"
 ARCH="all"
 PKG_DIR="deb-build/${NAME}_${VERSION}_${ARCH}"
 
@@ -31,23 +31,50 @@ mkdir -p \
 cp dictado.py "${PKG_DIR}/usr/lib/dictado/"
 chmod 644 "${PKG_DIR}/usr/lib/dictado/dictado.py"
 
-# ── Lanzador (sin consola) ────────────────────────────────────────────────────
+# ── Lanzador (registra errores en launcher.log) ───────────────────────────────
 cat > "${PKG_DIR}/usr/bin/dictado" << 'LAUNCHER'
 #!/usr/bin/env bash
+# dictado — lanzador del widget
 VENV=/var/lib/dictado/venv
-if [[ ! -x "$VENV/bin/python3" ]]; then
-    echo "ERROR: venv no encontrado en $VENV. Reinstala el paquete dictado." >&2
+LOG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vosk-dictado"
+LOG="$LOG_DIR/launcher.log"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+if [[ ! -x "$VENV/bin/python3" ]] \
+   || ! "$VENV/bin/python3" -c "import sys" >/dev/null 2>&1; then
+    MSG="ERROR: entorno Python roto en $VENV. Reinstala: sudo apt install --reinstall dictado"
+    echo "$MSG" >&2
+    echo "$(date -Is) $MSG" >> "$LOG" 2>/dev/null || true
     exit 1
 fi
+
+# Wayland: el portal GlobalShortcuts exige un 'app id', que systemd deduce
+# del scope 'app-<id>-<aleatorio>.scope'. Si no venimos de uno, relanzamos.
+IS_WAYLAND=0
+[[ "${XDG_SESSION_TYPE:-}" == "wayland" || -n "${WAYLAND_DISPLAY:-}" ]] && IS_WAYLAND=1
+unit="$(head -1 /proc/self/cgroup 2>/dev/null)"
+unit="${unit##*:}"
+unit="${unit##*/}"
+if (( IS_WAYLAND )) && [[ -z "${DICTADO_IN_SCOPE:-}" ]] \
+   && [[ "$unit" != app-* ]] && command -v systemd-run >/dev/null 2>&1; then
+    export DICTADO_IN_SCOPE=1
+    exec systemd-run --user --scope --quiet \
+        --unit="app-dictado-$(printf '%06x' $((RANDOM * RANDOM))).scope" \
+        /usr/bin/dictado "$@"
+fi
+
 exec "$VENV/bin/python3" -W ignore /usr/lib/dictado/dictado.py "$@" \
-    >/dev/null 2>&1
+    >>"$LOG" 2>&1
 LAUNCHER
 chmod 755 "${PKG_DIR}/usr/bin/dictado"
+
+# ── requirements.txt (lo usa el postinst) ─────────────────────────────────────
+cp requirements.txt "${PKG_DIR}/usr/lib/dictado/requirements.txt"
 
 # ── .desktop (integración con menú de escritorio) ─────────────────────────────
 cat > "${PKG_DIR}/usr/share/applications/dictado.desktop" << 'DESKTOP'
 [Desktop Entry]
-Version=1.0
+Version=1.1
 Type=Application
 Name=Dictado por Voz
 GenericName=Widget de dictado
@@ -58,6 +85,7 @@ Terminal=false
 Categories=Utility;Accessibility;
 Keywords=voz;dictado;transcripción;vosk;
 StartupNotify=false
+StartupWMClass=dictado
 DESKTOP
 chmod 644 "${PKG_DIR}/usr/share/applications/dictado.desktop"
 
@@ -112,7 +140,7 @@ Architecture: ${ARCH}
 Maintainer: Usuario <usuario@localhost>
 Section: utils
 Priority: optional
-Depends: python3 (>= 3.9), python3-venv, python3-tk, libportaudio2, xclip | xsel
+Depends: python3 (>= 3.9), python3-venv, python3-tk, libportaudio2, xclip | xsel, wl-clipboard, xdotool
 Description: Widget flotante de dictado por voz
  Transcribe voz a texto en tiempo real conectándose a un servidor Vosk
  mediante WebSocket. Incluye icono en bandeja del sistema, atajo de
@@ -129,17 +157,18 @@ VENV="/var/lib/dictado/venv"
 echo "Instalando entorno Python para Dictado por Voz..."
 echo "(Requiere conexión a internet para descargar paquetes)"
 
-python3 -m venv "$VENV"
+# Un cambio de versión de Python deja el venv inservible: se detecta y recrea.
+if [[ -e "$VENV" ]] && ! "$VENV/bin/python3" -c "import sys" >/dev/null 2>&1; then
+    echo "  venv anterior inservible (¿cambió Python?): se recrea"
+    rm -rf "$VENV"
+fi
+if [[ ! -x "$VENV/bin/python3" ]]; then
+    rm -rf "$VENV"
+    python3 -m venv "$VENV"
+fi
+
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet \
-    "sounddevice>=0.4.6" \
-    "websocket-client>=1.6.0" \
-    "pynput>=1.7.6" \
-    "pyperclip>=1.8.2" \
-    "numpy>=1.24.0" \
-    "pystray>=0.19" \
-    "Pillow>=9.0" \
-    "python-xlib>=0.33"
+"$VENV/bin/pip" install --quiet -r /usr/lib/dictado/requirements.txt
 
 # Actualizar caché de iconos si está disponible
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
@@ -168,7 +197,7 @@ chmod 755 "${PKG_DIR}/DEBIAN/prerm"
 
 # ── Construir el .deb ─────────────────────────────────────────────────────────
 DEB_OUT="deb-build/${NAME}_${VERSION}_${ARCH}.deb"
-dpkg-deb --build "${PKG_DIR}" "${DEB_OUT}"
+dpkg-deb --root-owner-group --build "${PKG_DIR}" "${DEB_OUT}"
 
 echo ""
 echo "✓ Paquete listo: ${DEB_OUT}"
