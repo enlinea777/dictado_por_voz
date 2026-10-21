@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.enlinea777.Dictado</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Dictado por Voz</name>
+  <summary>Dictado por voz en tiempo real con Vosk</summary>
+  <description>
+    <p>
+      Widget flotante que escucha el micrófono, envía el audio a un servidor
+      Vosk por WebSocket y escribe la transcripción en la ventana activa.
+    </p>
+    <p>
+      Incluye atajo global, icono en la bandeja del sistema y comandos de voz:
+      «listo enviar» escribe el texto y «listo copiar» lo copia al portapapeles.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.enlinea777.Dictado.desktop</launchable>
+  <url type="homepage">https://github.com/enlinea777/dictado_por_voz</url>
+  <url type="bugtracker">https://github.com/enlinea777/dictado_por_voz/issues</url>
+  <developer_name>enlinea777</developer_name>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>Utility</category>
+    <category>Accessibility</category>
+  </categories>
+  <releases>
+    <release version="1.1.0" date="2026-10-21">
+      <description>
+        <p>Soporte Wayland (portal GlobalShortcuts y envío por teclado).</p>
+        <p>Ventana que crece con el texto y botones anclados abajo.</p>
+        <p>Paquetes para Debian, Fedora, Arch, Windows y macOS.</p>
+      </description>
+    </release>
+  </releases>
+</component>

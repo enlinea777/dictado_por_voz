@@ -51,6 +51,7 @@ except Exception:                                    # pragma: no cover
     HAVE_X11 = False
 
 IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
 
 # pynput se importa bajo demanda: al importarlo abre una conexión X y en
 # sesiones Wayland sin Xauthority válido aborta el arranque de la app.
@@ -68,7 +69,8 @@ def _pynput():
 # ── Constantes ─────────────────────────────────────────────────────
 DEFAULT_HOST   = "xeon"
 DEFAULT_PORT   = "8085"
-DEFAULT_HOTKEY = "<ctrl>+<space>"
+# En macOS Ctrl+Space está ocupado por Spotlight / cambio de idioma.
+DEFAULT_HOTKEY = "<ctrl>+<alt>+<space>" if IS_MACOS else "<ctrl>+<space>"
 # Copa la transcripción sin necesidad de foco (la ventana sin bordes no
 # recibe teclado en Wayland). Se registra como segundo atajo global.
 DEFAULT_COPY_HOTKEY = "<ctrl>+<alt>+c"
@@ -77,6 +79,9 @@ BLOCK_FRAMES   = 4096
 
 if IS_WINDOWS:
     CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "vosk-dictado"
+elif IS_MACOS:
+    CONFIG_DIR = (Path.home() / "Library" / "Application Support"
+                  / "vosk-dictado")
 else:
     CONFIG_DIR = Path.home() / ".config" / "vosk-dictado"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
@@ -92,7 +97,7 @@ CMD_COPY = "listo copiar"
 
 
 def _detect_wayland() -> bool:
-    if IS_WINDOWS:
+    if IS_WINDOWS or IS_MACOS:
         return False
     if os.environ.get("WAYLAND_DISPLAY"):
         return True
@@ -108,7 +113,7 @@ DEFAULT_PASTE_KEY_TERMINAL = "ctrl+shift+v"
 # pega en ellas: Shift+Insert funciona en terminales y en casi todas las apps.
 DEFAULT_PASTE_KEY_WAYLAND = "shift+insert"
 # Cómo enviar el texto en Wayland: "escribir" (teclado virtual) o "pegar".
-DEFAULT_SEND_MODE = "escribir"
+DEFAULT_SEND_MODE = "pegar" if IS_MACOS else "escribir"
 
 # ── Paleta ─────────────────────────────────────────────────────────
 BG     = "#1a1f2e"
@@ -940,9 +945,14 @@ class DictadoApp:
 
         # Copiar/seleccionar como en cualquier editor (Tk no trae Ctrl+A y
         # su Ctrl+C puede bloquearse si otro cliente posee el portapapeles).
-        for seq in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+        copy_seqs = ["<Control-c>", "<Control-C>", "<Control-Insert>"]
+        select_seqs = ["<Control-a>", "<Control-A>"]
+        if IS_MACOS:
+            copy_seqs += ["<Command-c>", "<Command-C>"]
+            select_seqs += ["<Command-a>", "<Command-A>"]
+        for seq in copy_seqs:
             self.txt.bind(seq, self._copy_selection)
-        for seq in ("<Control-a>", "<Control-A>"):
+        for seq in select_seqs:
             self.txt.bind(seq, self._select_all_text)
         self.txt.bind("<Button-3>", self._text_menu)
 
@@ -1570,6 +1580,10 @@ class DictadoApp:
                 self._send_windows(text)
                 return
 
+            if IS_MACOS:
+                self._send_macos(text)
+                return
+
             # Activar la ventana destino si la conocemos
             if target_wid:
                 try:
@@ -1636,6 +1650,34 @@ class DictadoApp:
         log.debug("_send_windows: pegando con %s (método=%s)", key, method)
         if not _win_press_combo(key):
             log.error("No se pudo pegar el texto")
+
+    def _send_macos(self, text: str) -> None:
+        """Envía el texto en macOS: Cmd+V (o escritura con pynput)."""
+        mode = self.config.get("send", "mode", fallback=DEFAULT_SEND_MODE)
+        if mode in ("escribir", "auto"):
+            try:
+                _pynput().Controller().type(text)
+                log.info("[macos] Texto escrito con pynput (%d caracteres)",
+                         len(text))
+                return
+            except Exception as exc:
+                log.warning("[macos] No se pudo escribir (%s); se pega", exc)
+
+        method = _copy_to_clipboard(text)
+        if not method:
+            log.error("No se pudo copiar al portapapeles; texto: %r", text)
+            return
+        time.sleep(0.15)
+        try:
+            kb = _pynput()
+            ctrl = kb.Controller()
+            with ctrl.pressed(kb.Key.cmd):
+                ctrl.press("v")
+                ctrl.release("v")
+            log.debug("[macos] Pegado con Cmd+V (método=%s)", method)
+        except Exception as exc:
+            log.error("[macos] No se pudo pegar (¿permiso de Accesibilidad?): %s",
+                      exc)
 
     def _send_wayland(self, text: str) -> None:
         """Envía el texto a la ventana enfocada en Wayland.
@@ -1707,18 +1749,18 @@ class DictadoApp:
             # Nunca tocar Tk desde este hilo: la cola la consume el bucle UI.
             self._ui_queue.put(("toggle", None))
 
-        # Windows: pynput registra el atajo global con la API nativa.
-        if IS_WINDOWS:
+        # Windows/macOS: pynput registra el atajo global con la API nativa.
+        if IS_WINDOWS or IS_MACOS:
             try:
                 listener = _pynput().GlobalHotKeys({combo: activate})
                 listener.daemon = True
                 listener.start()
                 self._hotkey_listener = listener
                 self._hotkey_backends.append("win32-hotkey")
-                log.info("[hotkey] Windows: atajo global %r registrado", combo)
+                log.info("[hotkey] %s: atajo global %r registrado",
+                         "Windows" if IS_WINDOWS else "macOS", combo)
             except Exception as exc:
-                log.warning("[hotkey] No se pudo registrar el atajo en "
-                            "Windows: %s", exc)
+                log.warning("[hotkey] No se pudo registrar el atajo: %s", exc)
             return
 
         # En Wayland el atajo global se registra con el portal; XGrabKey se
@@ -1924,9 +1966,17 @@ class DictadoApp:
                 value=self.config.get("paste", "key_terminal",
                                       fallback=DEFAULT_PASTE_KEY_TERMINAL))
 
-        _sesion = "Windows" if IS_WINDOWS else ("Wayland" if IS_WAYLAND else "X11")
-        _inyeccion = ("SendInput (Unicode)" if IS_WINDOWS
-                      else ("uinput (evdev)" if IS_WAYLAND else "xdotool (XTest)"))
+        _sesion = ("Windows" if IS_WINDOWS else
+                   "macOS" if IS_MACOS else
+                   "Wayland" if IS_WAYLAND else "X11")
+        if IS_WINDOWS:
+            _inyeccion = "SendInput (Unicode)"
+        elif IS_MACOS:
+            _inyeccion = "pynput (Cmd+V)"
+        elif IS_WAYLAND:
+            _inyeccion = "uinput (evdev)"
+        else:
+            _inyeccion = "xdotool (XTest)"
         tk.Label(
             dlg,
             text=f"Sesión: {_sesion}  ·  inyección: {_inyeccion}",
@@ -2121,6 +2171,12 @@ class DictadoApp:
 
     def _start_tray(self) -> None:
         """Inicia el icono en la bandeja del sistema en un hilo dedicado."""
+        try:
+            self._start_tray_impl()
+        except Exception as exc:
+            log.warning("Bandeja del sistema no disponible: %s", exc)
+
+    def _start_tray_impl(self) -> None:
         def on_show(icon, item):
             self._ui_queue.put(("show", None))
 

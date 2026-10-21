@@ -1,0 +1,23 @@
+#!/bin/sh
+# AppRun del AppImage de Dictado por Voz
+HERE="$(dirname "$(readlink -f "$0")")"
+
+# En Wayland el portal GlobalShortcuts necesita un 'app id' que systemd
+# deduce del scope 'app-<id>-<aleatorio>.scope'. Se relanza dentro de uno
+# si hace falta (y si el .desktop está integrado en el sistema).
+IS_WAYLAND=0
+if [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    IS_WAYLAND=1
+fi
+unit="$(head -1 /proc/self/cgroup 2>/dev/null)"
+unit="${unit##*:}"
+unit="${unit##*/}"
+if [ "$IS_WAYLAND" = 1 ] && [ -z "${DICTADO_IN_SCOPE:-}" ] \
+   && [ "${unit#app-}" = "$unit" ] && command -v systemd-run >/dev/null 2>&1; then
+    export DICTADO_IN_SCOPE=1
+    exec systemd-run --user --scope --quiet \
+        --unit="app-dictado-$(printf '%06x' $((RANDOM * RANDOM))).scope" \
+        "$0" "$@"
+fi
+
+exec "$HERE/usr/bin/Dictado" "$@"

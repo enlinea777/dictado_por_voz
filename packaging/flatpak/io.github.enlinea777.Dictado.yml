@@ -1,0 +1,56 @@
+# Manifest de Flatpak para Dictado por Voz.
+# Construir:  flatpak-builder --force-clean --repo=repo build \
+#               packaging/flatpak/io.github.enlinea777.Dictado.yml
+# Empaquetar: flatpak build-bundle repo dictado.flatpak \
+#               io.github.enlinea777.Dictado
+#
+# Para Flathub hay que enviar este manifest (con el submódulo de fuentes
+# apuntando a un tag) mediante un PR a https://github.com/flathub/flathub.
+app-id: io.github.enlinea777.Dictado
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: dictado
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --share=network
+  # /dev/uinput (escribir como un teclado real) y micrófono
+  - --device=all
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --env=PATH=/app/bin:/usr/bin
+
+modules:
+  - name: wl-clipboard
+    buildsystem: meson
+    config-opts:
+      - -Dfish-completions=false
+      - -Dzsh-completions=false
+      - -Dbash-completions=false
+    sources:
+      - type: git
+        url: https://github.com/bugaevc/wl-clipboard.git
+        tag: v2.2.1
+
+  - name: dictado
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-cache-dir --break-system-packages --prefix=/app
+        sounddevice>=0.4.6 websocket-client>=1.6.0 pynput>=1.7.6
+        pyperclip>=1.8.2 numpy>=1.24.0 pystray>=0.19 Pillow>=9.0
+        python-xlib>=0.33 dbus-fast>=5.0 evdev>=1.6
+      - install -Dm644 dictado.py /app/share/dictado/dictado.py
+      - install -Dm755 packaging/flatpak/dictado.sh /app/bin/dictado
+      - install -Dm644 packaging/flatpak/io.github.enlinea777.Dictado.desktop
+        /app/share/applications/io.github.enlinea777.Dictado.desktop
+      - install -Dm644 packaging/flatpak/io.github.enlinea777.Dictado.metainfo.xml
+        /app/share/metainfo/io.github.enlinea777.Dictado.metainfo.xml
+      - install -Dm644 packaging/icon/dictado.png
+        /app/share/icons/hicolor/128x128/apps/io.github.enlinea777.Dictado.png
+    sources:
+      - type: dir
+        path: ../..

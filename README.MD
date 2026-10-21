@@ -81,6 +81,12 @@ las tres familias en **Releases**:
 | Fedora | `dictado-*.noarch.rpm` | `sudo dnf install ./dictado-*.noarch.rpm` |
 | Arch Linux | `dictado-*.pkg.tar.zst` | `sudo pacman -U ./dictado-*.pkg.tar.zst` |
 | Windows 10/11 | `dictado-*-setup.exe` | ejecutar el instalador (siguiente, siguiente) |
+| macOS Intel / Apple Silicon | `Dictado-*-macos-x86_64.dmg` / `-macos-arm64.dmg` | abrir el DMG y arrastrar a *Aplicaciones* |
+| Linux (AppImage, x86_64/ARM) | `dictado-*-x86_64.AppImage` / `-aarch64.AppImage` | `chmod +x` y ejecutar |
+| Linux (Flatpak) | `dictado-*-x86_64.flatpak` / `-aarch64.flatpak` | `flatpak install ./dictado-*.flatpak` |
+
+Los paquetes `.deb`, `.rpm` y de Arch son **independientes de la arquitectura**
+(`all`/`noarch`), así que el mismo archivo sirve en x86_64 y en ARM.
 
 Los tres paquetes instalan el lanzador `/usr/bin/dictado`, la entrada de menú
 y el icono, y crean el entorno Python en `/var/lib/dictado/venv` durante la
@@ -114,16 +120,72 @@ opcionalmente en el escritorio, y añade el desinstalador.
 
 En Windows la app usa la API nativa:
 
-| Función | Linux | Windows |
-|---|---|---|
-| Atajo global | portal GlobalShortcuts / XGrabKey | hook de teclado (`pynput`) |
-| Enviar texto | teclado virtual `uinput` / `SendInput` equivalente | `SendInput` con `KEYEVENTF_UNICODE` |
-| Pegar (modo alternativo) | `wl-copy` + `shift+insert` | portapapeles + `Ctrl+V` |
-| Bandeja del sistema | AppIndicator | bandeja nativa (`pystray`) |
-| Configuración/log | `~/.config/vosk-dictado/` | `%APPDATA%\vosk-dictado\` |
+| Función | Linux | Windows | macOS |
+|---|---|---|---|
+| Atajo global | portal GlobalShortcuts / XGrabKey | hook de teclado (`pynput`) | `pynput` |
+| Enviar texto | teclado virtual `uinput` | `SendInput` (`KEYEVENTF_UNICODE`) | portapapeles + `Cmd+V` |
+| Pegar (modo alternativo) | `wl-copy` + `shift+insert` | portapapeles + `Ctrl+V` | portapapeles + `Cmd+V` |
+| Bandeja del sistema | AppIndicator | bandeja nativa (`pystray`) | barra de menús (`pystray`) |
+| Configuración/log | `~/.config/vosk-dictado/` | `%APPDATA%\vosk-dictado\` | `~/Library/Application Support/vosk-dictado/` |
 
 El texto se escribe carácter a carácter con `SendInput` Unicode, así que las
 tildes y la ñ funcionan en cualquier ventana, incluida la consola.
+
+### macOS (DMG)
+
+Descarga `Dictado-<versión>-macos-arm64.dmg` (Apple Silicon) o
+`-macos-x86_64.dmg` (Intel), ábrelo y arrastra *Dictado* a *Aplicaciones*.
+La app va firmada ad-hoc (sin notarizar): la primera vez hay que abrirla con
+clic derecho → *Abrir*, o ir a *Ajustes → Privacidad y seguridad → Abrir
+igual*.
+
+Permisos necesarios en macOS:
+- **Micrófono** (se pide al empezar a grabar).
+- **Accesibilidad**: para el atajo global y para pegar con `Cmd+V`
+  (*Ajustes → Privacidad y seguridad → Accesibilidad*).
+
+El atajo por defecto en macOS es `Ctrl+Alt+Espacio` (porque `Ctrl+Espacio`
+lo usa Spotlight) y el texto se envía con el portapapeles + `Cmd+V`.
+
+### Linux ARM (aarch64)
+
+No hace falta un paquete distinto: el `.deb`, el `.rpm` y el paquete de Arch
+son `all`/`noarch` y funcionan igual en Raspberry Pi, servidores ARM, etc.
+Las dependencias (numpy, Pillow, sounddevice, evdev, dbus-fast) se instalan
+desde PyPI con ruedas `aarch64`. Para AppImage y Flatpak sí hay builds
+específicos `aarch64`.
+
+### AppImage
+
+`dictado-<versión>-<arch>.AppImage` es un único archivo ejecutable con Python
+y todas las dependencias dentro:
+
+```bash
+chmod +x dictado-*-x86_64.AppImage
+./dictado-*-x86_64.AppImage
+```
+
+Necesita `libfuse2` para ejecutarse en Ubuntu 22.04+ (`sudo apt install libfuse2`),
+o usar `--appimage-extract-and-run`. El atajo global funciona igual (portal en
+Wayland / XGrabKey en X11).
+
+### Flatpak
+
+```bash
+flatpak install ./dictado-<versión>-x86_64.flatpak
+flatpak run io.github.enlinea777.Dictado
+```
+
+El manifiesto (`packaging/flatpak/io.github.enlinea777.Dictado.yml`) está
+preparado para **Flathub**: incluye metainfo AppStream, icono, `.desktop` con
+el app id y `finish-args` para micrófono (`--socket=pulseaudio`), `uinput`
+(`--device=all`), portal de atajos y bandeja. Para publicar en Flathub hay que
+enviar ese manifiesto mediante un PR a
+[flathub/flathub](https://github.com/flathub/flathub) apuntando a un tag del
+repo (Flathub no se puede automatizar desde este CI).
+
+Dentro del sandbox el texto se envía **pegando** (`wl-clipboard` va incluido en
+el bundle), porque no hay `xmodmap` para leer la distribución de teclado.
 
 ### Opción C — Script portable (sin instalación)
 
@@ -321,7 +383,9 @@ vosk-dictado/
 │   ├── rpm/dictado.spec  # Empaquetado Fedora/RHEL
 │   ├── arch/             # PKGBUILD + .INSTALL (Arch Linux)
 │   ├── windows/dictado.iss  # Instalador de Windows (Inno Setup)
-│   └── icon/dictado.{png,ico}
+│   ├── appimage/         # AppRun + .desktop del AppImage
+│   ├── flatpak/          # Manifiesto, metainfo y lanzador del Flatpak
+│   └── icon/dictado.{png,ico,icns}
 ├── .github/workflows/release.yml  # CI: deb + rpm + Arch → Release
 └── README.MD             # Este archivo
 ```
@@ -334,9 +398,11 @@ git push origin v1.1.0
 ```
 
 GitHub Actions construye los paquetes en entornos limpios: `.deb`
-(`ubuntu-latest`), `.rpm` (`fedora:latest`), Arch (`archlinux:latest`) y el
-instalador de Windows (`windows-latest` con PyInstaller + Inno Setup), y los
-adjunta a la release junto con `dictado-portable.sh`. También se puede lanzar a mano desde
+(`ubuntu-latest`), `.rpm` (`fedora:latest`), Arch (`archlinux:latest`),
+instalador de Windows (`windows-latest`, PyInstaller + Inno Setup), DMG de
+macOS (`macos-13` Intel y `macos-14` ARM con PyInstaller), AppImage y Flatpak
+en x86_64 y aarch64 (`ubuntu-latest` / `ubuntu-24.04-arm`), y los adjunta a la
+release junto con `dictado-portable.sh`. También se puede lanzar a mano desde
 *Actions → Release → Run workflow*.
 
 ---

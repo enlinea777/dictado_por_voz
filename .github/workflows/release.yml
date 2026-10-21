@@ -149,9 +149,166 @@ jobs:
           path: packaging/windows/Output/*.exe
           if-no-files-found: error
 
+  macos:
+    name: macOS (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch: x86_64
+          - runner: macos-14
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Construir .app
+        run: |
+          pyinstaller --noconfirm --clean --windowed \
+            --name Dictado \
+            --icon packaging/icon/dictado.icns \
+            --osx-bundle-identifier io.github.enlinea777.Dictado \
+            --collect-all sounddevice \
+            --collect-submodules pystray \
+            dictado.py
+          PLIST=dist/Dictado.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string \
+            'Dictado por Voz necesita el microfono para transcribir tu voz.'" "$PLIST" \
+            || /usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription \
+            'Dictado por Voz necesita el microfono para transcribir tu voz.'" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST" || true
+          codesign --force --deep --sign - dist/Dictado.app
+      - name: Crear DMG
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          mkdir -p dmg
+          cp -R dist/Dictado.app dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Dictado" -srcfolder dmg -ov -format UDZO \
+            "Dictado-$VERSION-macos-${{ matrix.arch }}.dmg"
+          ls -l ./*.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: ./*.dmg
+          if-no-files-found: error
+
+  appimage:
+    name: AppImage (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk libportaudio2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pyinstaller --noconfirm --clean --onedir \
+            --name Dictado \
+            --collect-all sounddevice \
+            --collect-submodules pystray \
+            dictado.py
+      - name: AppDir
+        run: |
+          set -eux
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications \
+                   AppDir/usr/share/icons/hicolor/256x256/apps
+          cp -a dist/Dictado/. AppDir/usr/bin/
+          cp packaging/appimage/dictado.desktop AppDir/usr/share/applications/
+          # appimagetool exige el .desktop también en la raíz del AppDir
+          cp packaging/appimage/dictado.desktop AppDir/dictado.desktop
+          cp packaging/appimage/AppRun AppDir/AppRun
+          chmod +x AppDir/AppRun
+          python - <<'PY'
+          from PIL import Image
+          Image.open("packaging/icon/dictado.png").resize((256, 256)).save(
+              "AppDir/usr/share/icons/hicolor/256x256/apps/dictado.png")
+          PY
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/dictado.png AppDir/dictado.png
+          ln -sf usr/share/icons/hicolor/256x256/apps/dictado.png AppDir/.DirIcon
+      - name: appimagetool
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eux
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run AppDir \
+            "dictado-${VERSION}-${ARCH}.AppImage"
+          ls -l ./*.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage-${{ matrix.arch }}
+          path: ./*.AppImage
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Herramientas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --if-not-exists --user flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.gnome.Platform//50 org.gnome.Sdk//50
+      - name: Construir y empaquetar
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eux
+          flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --repo=repo build \
+            packaging/flatpak/io.github.enlinea777.Dictado.yml
+          flatpak build-bundle repo \
+            "dictado-${VERSION}-${{ matrix.arch }}.flatpak" \
+            io.github.enlinea777.Dictado
+          ls -l ./*.flatpak
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: ./*.flatpak
+          if-no-files-found: error
+
   release:
     name: Publicar release
-    needs: [version, deb, rpm, arch, windows]
+    needs: [version, deb, rpm, arch, windows, macos, appimage, flatpak]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -173,6 +330,12 @@ jobs:
             echo "| Fedora | \`dictado-*.noarch.rpm\` | \`sudo dnf install ./archivo.rpm\` |"
             echo "| Arch Linux | \`dictado-*.pkg.tar.zst\` | \`sudo pacman -U ./archivo.pkg.tar.zst\` |"
             echo "| Windows 10/11 | \`dictado-*-setup.exe\` | ejecutar el instalador |"
+            echo "| macOS (Intel/ARM) | \`Dictado-*-macos-*.dmg\` | abrir el DMG y arrastrar a Aplicaciones |"
+            echo "| Linux (x86_64/ARM) | \`dictado-*.AppImage\` | \`chmod +x\` y ejecutar |"
+            echo "| Linux (Flatpak) | \`dictado-*.flatpak\` | \`flatpak install ./archivo.flatpak\` |"
+            echo
+            echo "Los paquetes \`.deb\`, \`.rpm\` y de Arch son independientes de la"
+            echo "arquitectura (\`all\`/\`noarch\`): sirven tanto en x86_64 como en ARM."
             echo
             echo "También puedes usar el script portable \`dictado-portable.sh\` (sin instalar)."
             echo
@@ -190,4 +353,7 @@ jobs:
             dist/**/*.rpm
             dist/**/*.pkg.tar.zst
             dist/**/*.exe
+            dist/**/*.dmg
+            dist/**/*.AppImage
+            dist/**/*.flatpak
             dictado-portable.sh
