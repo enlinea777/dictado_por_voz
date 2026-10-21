@@ -63,6 +63,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -eux
+          git config --global --add safe.directory "$PWD"
           mkdir -p /root/rpmbuild/SOURCES /root/rpmbuild/SPECS
           git archive --format=tar.gz --prefix="dictado-$VERSION/" \
               -o "/root/rpmbuild/SOURCES/dictado-$VERSION.tar.gz" HEAD
