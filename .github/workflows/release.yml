@@ -64,17 +64,18 @@ jobs:
         run: |
           set -eux
           git config --global --add safe.directory "$PWD"
-          mkdir -p /root/rpmbuild/SOURCES /root/rpmbuild/SPECS
+          mkdir -p "$HOME/rpmbuild/SOURCES" "$HOME/rpmbuild/SPECS"
           git archive --format=tar.gz --prefix="dictado-$VERSION/" \
-              -o "/root/rpmbuild/SOURCES/dictado-$VERSION.tar.gz" HEAD
+              -o "$HOME/rpmbuild/SOURCES/dictado-$VERSION.tar.gz" HEAD
           sed "s/^Version:.*/Version: $VERSION/" packaging/rpm/dictado.spec \
-              > /root/rpmbuild/SPECS/dictado.spec
-          rpmbuild -ba /root/rpmbuild/SPECS/dictado.spec
-          ls -l /root/rpmbuild/RPMS/*/
+              > "$HOME/rpmbuild/SPECS/dictado.spec"
+          rpmbuild -ba "$HOME/rpmbuild/SPECS/dictado.spec"
+          mkdir -p /out && cp "$HOME"/rpmbuild/RPMS/*/*.rpm /out/
+          ls -l /out
       - uses: actions/upload-artifact@v4
         with:
           name: rpm
-          path: /root/rpmbuild/RPMS/*/*.rpm
+          path: /out/*.rpm
           if-no-files-found: error
 
   arch:
